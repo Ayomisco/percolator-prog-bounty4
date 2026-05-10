@@ -11272,7 +11272,17 @@ pub mod processor {
         let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
         verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-        let amt_units = match engine.force_close_resolved_not_atomic(user_idx)
+        // PORT-19 (HIGH SF): Tag 21 admin force-close-with-fee. Use the
+        // with_fee variant added in Wave 1 ENG-PORT-B so admin-driven
+        // resolved closes charge accrued maintenance fees at the
+        // resolved-slot anchor (matching toly's spec-§9.9 step 5
+        // ordering). Was: `force_close_resolved_not_atomic` which
+        // skipped the fee charge as fork's prior FEATURE-DIVERGENCE.
+        let amt_units = match engine
+            .force_close_resolved_with_fee_not_atomic(
+                user_idx,
+                config.maintenance_fee_per_slot,
+            )
             .map_err(map_risk_error)?
         {
             percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -11803,7 +11813,15 @@ pub mod processor {
         );
         verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-        let amt_units = match engine.force_close_resolved_not_atomic(user_idx)
+        // PORT-19 (HIGH SF): Tag 30 force-close-resolved-with-fee. Same
+        // rationale as Tag 21 above — use the with_fee variant from
+        // Wave 1 ENG-PORT-B so the permissionless force-close path
+        // charges maintenance fees at resolved-slot anchor.
+        let amt_units = match engine
+            .force_close_resolved_with_fee_not_atomic(
+                user_idx,
+                config.maintenance_fee_per_slot,
+            )
             .map_err(map_risk_error)?
         {
             percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
