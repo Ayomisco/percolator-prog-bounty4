@@ -2549,7 +2549,11 @@ pub mod ix {
         let params = RiskParams {
             maintenance_margin_bps,
             initial_margin_bps,
-            trading_fee_bps,
+            // Wave 6b (KL-DYNAMIC-TRADE-FEE-1 REVOKED): engine field
+            // renamed `trading_fee_bps` → `max_trading_fee_bps`. The wire
+            // format is unchanged (u64 at the same offset); only the
+            // engine struct field name changed.
+            max_trading_fee_bps: trading_fee_bps,
             max_accounts,
             liquidation_fee_bps,
             liquidation_fee_cap,
@@ -6990,6 +6994,12 @@ pub mod processor {
         // maintenance_margin_bps through so the engine's 10th arg
         // actually consumes against maintenance margin during admission.
         let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
+        // Wave 6b (KL-DYNAMIC-TRADE-FEE-1 REVOKED): pass per-trade fee bps.
+        // Default to the configured cap (`max_trading_fee_bps`) to preserve
+        // the fork's prior static-fee-at-cap behavior. Per-call variation
+        // can be introduced by future wrapper features without changing the
+        // engine signature.
+        let trade_fee_bps = engine.params.max_trading_fee_bps;
         engine.execute_trade_not_atomic(
             a,
             b,
@@ -6998,6 +7008,7 @@ pub mod processor {
             abs_size,
             exec.price,
             funding_rate_e9,
+            trade_fee_bps,
             admit_h_min,
             admit_h_max,
             admit_threshold,
@@ -8122,7 +8133,7 @@ pub mod processor {
             {
                 return Err(ProgramError::InvalidInstructionData);
             }
-            if p.trading_fee_bps > 10_000 || p.liquidation_fee_bps > 10_000 {
+            if p.max_trading_fee_bps > 10_000 || p.liquidation_fee_bps > 10_000 {
                 return Err(ProgramError::InvalidInstructionData);
             }
             // v12.19: public live warmup floor must be >= 1; h_min == 0
@@ -9142,7 +9153,7 @@ pub mod processor {
         let current_fee_paid_cap = current_trade_fee_paid_cap(
             size,
             price,
-            engine.params.trading_fee_bps as u64,
+            engine.params.max_trading_fee_bps as u64,
         )?;
 
         #[cfg(feature = "cu-audit")]
@@ -9562,7 +9573,7 @@ pub mod processor {
             let band_bps = {
                 let data_ref = a_slab.try_borrow_data()?;
                 let engine_ref = zc::engine_ref(&data_ref)?;
-                let fee_bps = engine_ref.params.trading_fee_bps;
+                let fee_bps = engine_ref.params.max_trading_fee_bps;
                 core::cmp::max(fee_bps.saturating_mul(2), 100)
             };
             let diff = if exec_price > price {
@@ -9624,7 +9635,7 @@ pub mod processor {
             let current_fee_paid_cap = current_trade_fee_paid_cap(
                 trade_size,
                 exec_price,
-                engine.params.trading_fee_bps as u64,
+                engine.params.max_trading_fee_bps as u64,
             )?;
 
             #[cfg(feature = "cu-audit")]

@@ -1085,7 +1085,8 @@ fn risk_params_full_round_trip_via_init_market() {
             assert_eq!(risk_params.h_min, warmup, "h_min");
             assert_eq!(risk_params.maintenance_margin_bps, mm_bps, "maintenance_margin_bps");
             assert_eq!(risk_params.initial_margin_bps, im_bps, "initial_margin_bps");
-            assert_eq!(risk_params.trading_fee_bps, fee_bps, "trading_fee_bps");
+            // Wave 6b: engine renamed `trading_fee_bps` → `max_trading_fee_bps`.
+            assert_eq!(risk_params.max_trading_fee_bps, fee_bps, "max_trading_fee_bps");
             assert_eq!(risk_params.max_accounts, max_accts, "max_accounts");
             // v12.19: new_account_fee moved to wrapper MarketConfig
             let _ = new_acct_fee;
