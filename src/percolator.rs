@@ -11430,13 +11430,22 @@ pub mod processor {
         // SECURITY: Read fee debt BEFORE the SPL transfer to reject
         // overpayment. Without this, excess tokens become stranded
         // vault surplus with no withdrawal path for the user.
-        accounts::expect_len(accounts, 6)?;
+        //
+        // PORT-20 (HIGH SF): wire-format change — account [6] is now the
+        // oracle account. The pre-engine accrue + target-lag gates that
+        // landed for Tag 28 (PORT-21) and other account-limited ops
+        // require a live oracle price. Toly's tag 27 already takes the
+        // oracle account; fork hadn't carried the wire change forward.
+        // SDKs constructing Tag 27 transactions must now pass the same
+        // Pyth/Chainlink account they pass to other market touchpoints.
+        accounts::expect_len(accounts, 7)?;
         let a_user = &accounts[0];
         let a_slab = &accounts[1];
         let a_user_ata = &accounts[2];
         let a_vault = &accounts[3];
         let a_token = &accounts[4];
         let a_clock = &accounts[5];
+        let a_oracle = &accounts[6];
 
         accounts::expect_signer(a_user)?;
         accounts::expect_writable(a_slab)?;
@@ -11483,17 +11492,49 @@ pub mod processor {
         // Phase 3: SPL transfer (only after validation)
         collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
-        // Phase 4: Engine deposit_fee_credits (mutable borrow)
-        // Vault already verified in Phase 1.
+        // Phase 4: Engine deposit_fee_credits (mutable borrow).
+        // PORT-20 (HIGH SF): pre-call accrue + target-lag gates so
+        // deposit_fee_credits sees post-funding state. The flow is the
+        // same account-limited-op pattern landed for Tag 10 (PORT-3c)
+        // and Tag 28 (PORT-21):
+        //   1. capture funding rate BEFORE oracle read (anti-retroactivity §5.5)
+        //   2. read live oracle (non-Hyperp) or cached engine price (Hyperp)
+        //   3. ensure_market_accrued_to_now_for_account_limited_op
+        //   4. reject_any_target_lag
+        //   5. engine.deposit_fee_credits (existing engine call)
         let mut data = state::slab_data_mut(a_slab)?;
-        let config = state::read_config(&data);
+        let mut config = state::read_config(&data);
         let clock = Clock::from_account_info(a_clock)?;
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        let price = if is_hyperp {
+            let engine = zc::engine_ref(&data)?;
+            engine.last_oracle_price
+        } else {
+            let p = read_price_and_stamp(
+                &mut config,
+                a_oracle,
+                clock.unix_timestamp,
+                clock.slot,
+                Some(&mut data),
+            )?;
+            state::write_config(&mut data, &config);
+            p
+        };
         let (units2, _dust) = crate::units::base_to_units(amount, config.unit_scale);
         // dust is always 0 here — rejected by `dust != 0` check in Phase 2.
 
         let engine = zc::engine_mut(&mut data)?;
-        engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
+        ensure_market_accrued_to_now_for_account_limited_op(
+            engine, &config, clock.slot, price, funding_rate_e9,
+        )?;
+        reject_any_target_lag(&config, engine)?;
+        engine
+            .deposit_fee_credits(user_idx, units2 as u128, clock.slot)
             .map_err(map_risk_error)?;
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
         Ok(())
     }
 
