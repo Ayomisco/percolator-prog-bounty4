@@ -10840,13 +10840,20 @@ pub mod processor {
     #[inline(never)]
     fn handle_resolve_permissionless<'a>(
         program_id: &Pubkey,
-        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
         // Permissionless resolution when oracle is actually dead.
-        // Anyone can call. Requires oracle account to prove staleness.
+        // Anyone can call. CRITICAL-2 anchor: routes through
+        // engine.resolve_market_not_atomic (Degenerate arm). Engine becomes
+        // the source of truth for terminal-state fields.
         accounts::expect_len(accounts, 3)?;
         let a_slab = &accounts[0];
         let a_clock = &accounts[1];
-        let a_oracle = &accounts[2];
+        // Account [2] (oracle) preserved for wire-format compat with existing
+        // SDKs. Staleness now derives from config liveness counters
+        // (last_good_oracle_slot / mark_ewma_last_slot / last_mark_push_slot)
+        // via oracle::permissionless_stale_matured — no live oracle read here.
+        let _a_oracle = &accounts[2];
 
         accounts::expect_writable(a_slab)?;
 
@@ -10854,139 +10861,75 @@ pub mod processor {
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
 
-        if state::is_resolved(&data) {
+        // Reject re-resolve. Engine.market_mode is the source of truth
+        // (set by engine.resolve_market_not_atomic below); fork's wrapper
+        // FLAG_RESOLVED bit is layered on afterwards.
+        if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
             return Err(ProgramError::InvalidAccountData);
         }
 
         let mut config = state::read_config(&data);
-        // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
-        let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
 
-        if config.permissionless_resolve_stale_slots == 0 {
+        // PORT (Hunk 2 / SIMD-0047 cluster-restart bypass): a post-init
+        // `LastRestartSlot` bump invalidates the slot-based staleness
+        // assumption, so markets initialised with
+        // permissionless_resolve_stale_slots = 0 (operator-disabled) still
+        // get a recovery path through the Degenerate arm. Without this
+        // bypass, those markets become permanently un-resolvable after a
+        // cluster restart, trapping all funds.
+        let restarted = oracle::cluster_restarted_since_init(&config);
+        if !restarted && config.permissionless_resolve_stale_slots == 0 {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
 
         let clock = Clock::from_account_info(a_clock)?;
 
-        // Verify oracle is actually stale RIGHT NOW by trying to read it.
-        // Only OracleStale proves the oracle is dead. Other errors
-        // (wrong account, bad data) don't prove staleness — they could
-        // be an attacker passing garbage to fake oracle death.
-        let is_hyperp = oracle::is_hyperp_mode(&config);
-        if !is_hyperp {
-            let oracle_result = oracle::read_engine_price_e6(
-                a_oracle, &config.index_feed_id,
-                clock.unix_timestamp, config.max_staleness_secs,
-                config.conf_filter_bps, config.invert, config.unit_scale,
-            );
-            match oracle_result {
-                Ok(_) => return Err(ProgramError::InvalidAccountData), // live
-                Err(e) => {
-                    let stale_err: ProgramError = PercolatorError::OracleStale.into();
-                    if e != stale_err {
-                        return Err(e); // wrong account / bad data — propagate
-                    }
-                    // OracleStale = oracle is actually dead → proceed
-                }
-            }
-        } else {
-            // Hyperp: check mark staleness (last trade or push)
-            let last_update = core::cmp::max(
-                config.mark_ewma_last_slot,
-                config.last_mark_push_slot as u64,
-            );
-            let staleness = clock.slot.saturating_sub(last_update);
-            if staleness < config.permissionless_resolve_stale_slots {
-                return Err(PercolatorError::OracleStale.into());
-            }
+        // PORT (Hunk 3): single-source staleness check.
+        // oracle::permissionless_stale_matured already covers cluster-restart
+        // bypass, feature-disabled gate, hyperp / non-hyperp last_live_slot
+        // selection, and the dead-duration ≥ stale-slots predicate.
+        if !oracle::permissionless_stale_matured(&config, clock.slot) {
+            return Err(PercolatorError::OracleStale.into());
         }
 
-        // Require oracle/mark has been dead for the configured delay.
-        // Non-Hyperp: use dedicated last_good_oracle_slot, stamped on every
-        //   successful read_price_clamped across all instruction paths.
-        // Hyperp: use max(mark_ewma_last_slot, last_mark_push_slot) — the
-        //   same signal used for the mark staleness check above, so both
-        //   checks use consistent liveness information.
-        {
-            let reference_slot = if !is_hyperp {
-                config.last_good_oracle_slot
-            } else {
-                core::cmp::max(
-                    config.mark_ewma_last_slot,
-                    config.last_mark_push_slot as u64,
-                )
-            };
-            let oracle_dead_duration = clock.slot.saturating_sub(reference_slot);
-            if oracle_dead_duration < config.permissionless_resolve_stale_slots {
-                return Err(PercolatorError::OracleStale.into());
-            }
-        }
-
-        // Flush Hyperp index + accrue to boundary (Bug 1+3 fix)
-        if is_hyperp {
-            let mark = if config.mark_ewma_e6 > 0 {
-                config.mark_ewma_e6
-            } else {
-                config.hyperp_mark_e6
-            };
-            let prev_index = config.last_effective_price_e6;
-            if mark > 0 && prev_index > 0 {
-                let last_idx_slot = config.last_hyperp_index_slot;
-                // Use clock.slot (not engine.last_market_slot) to avoid
-                // monotonicity failure when current_slot > last_crank_slot
-                // from trades/withdrawals after the last crank.
-                let dt = clock.slot.saturating_sub(last_idx_slot);
-                let new_index = oracle::clamp_toward_with_dt(
-                    prev_index.max(1), mark,
-                    config.oracle_price_cap_e2bps, dt,
-                );
-                config.last_effective_price_e6 = new_index;
-                config.last_hyperp_index_slot = clock.slot;
-            }
-            state::write_config(&mut data, &config);
-            // Accrue at the mark (settlement price), not the smoothed index.
-            // force_close_resolved uses K coefficients that must reflect mark.
-            let settle_price = mark.max(1);
+        // PORT (Hunk 1, CRITICAL-2): route through
+        // engine.resolve_market_not_atomic with the Degenerate arm. Replaces
+        // fork's prior manual accrue path which left engine.market_mode =
+        // Live and only flipped the wrapper FLAG_RESOLVED bit. The Degenerate
+        // arm uses p_last as both `resolved_price` and `live_oracle_price`,
+        // forces funding_rate_e9 = 0, and crystallises engine.resolved_price.
+        //
+        // PERCOLATOR-FORK-SPECIFIC: SKIP fork's prior Hyperp pre-flush
+        // (Hunk 4 / DRIFT). With the Degenerate arm settling at p_last, no
+        // wrapper-side index flush is needed in the resolve-permissionless
+        // path. The previous flush also computed `funding_rate_e9` for a
+        // manual accrue (Hunk 5) — both become dead code under the engine
+        // call.
+        let p_last = {
             let engine = zc::engine_mut(&mut data)?;
-            engine.accrue_market_to(
-                clock.slot,
-                settle_price,
-                funding_rate_e9,
-            ).map_err(map_risk_error)?;
-            config = state::read_config(&data);
-        }
-
-        // Settlement price = last oracle price from engine.
-        // Reject only if completely uninitialized (p == 0).
-        // The non-Hyperp init sentinel (p=1) is harmless: if no one ever
-        // traded or cranked, there are no positions to settle. If anyone
-        // did interact, accrue_market_to updated last_oracle_price to the
-        // real price. The sentinel cannot cause incorrect settlement because:
-        // - All resolve paths require crank staleness (no recent activity)
-        // - If the market had activity, last_oracle_price reflects it
-        // - Resolution at p=1 on an empty market is a no-op
-        let last_price = {
-            let engine = zc::engine_ref(&data)?;
             let p = engine.last_oracle_price;
             if p == 0 {
                 return Err(PercolatorError::OracleInvalid.into());
             }
+            engine
+                .resolve_market_not_atomic(
+                    percolator::ResolveMode::Degenerate,
+                    p,
+                    p,
+                    clock.slot,
+                    0,
+                )
+                .map_err(map_risk_error)?;
             p
         };
 
-        // Accrue engine to settlement price before entering resolved mode.
-        // Hyperp already accrued above; non-Hyperp accrues here.
-        if !is_hyperp {
-            let engine = zc::engine_mut(&mut data)?;
-            engine.accrue_market_to(clock.slot, last_price, funding_rate_e9)
-                .map_err(map_risk_error)?;
-        }
-
-        // Use clock.slot (not engine.last_market_slot) — other instructions
-        // advance current_slot past last_crank_slot, so using the stale
-        // crank slot would make resolved touch paths fail monotonic checks.
-        config.hyperp_mark_e6 = last_price;
+        // PERCOLATOR-FORK-SPECIFIC: keep config.hyperp_mark_e6 in sync with
+        // engine.resolved_price for downstream readers (Tag 20/21/30) until
+        // PORT-18/19 switches them to engine.resolved_price directly.
+        config.hyperp_mark_e6 = p_last;
         state::write_config(&mut data, &config);
+        // PERCOLATOR-FORK-SPECIFIC: KEEP fork's wrapper FLAG_RESOLVED bit so
+        // state::is_resolved() readers stay in sync with engine.market_mode.
         state::set_resolved(&mut data);
         Ok(())
     }
