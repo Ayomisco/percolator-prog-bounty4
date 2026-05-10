@@ -11540,8 +11540,44 @@ pub mod processor {
         if dust != 0 {
             return Err(ProgramError::InvalidArgument);
         }
+        // PORT-21 (HIGH SF): account-limited progress + target-lag gates
+        // + pre-settle. ConvertReleasedPnl only touches user_idx — the
+        // market-progress gate must run before the operation so admission
+        // is decided against post-funding capital. settle_account_then_sync_fee_current
+        // realises lazy mark/funding losses on the user's account and
+        // syncs maintenance fees; the convert call then operates on
+        // post-settle state.
+        ensure_market_accrued_to_now_for_account_limited_op(
+            engine, &config, clock.slot, price, funding_rate_e9,
+        )?;
+        reject_any_target_lag(&config, engine)?;
+        settle_account_then_sync_fee_current(
+            engine,
+            &config,
+            user_idx,
+            clock.slot,
+            price,
+            funding_rate_e9,
+            engine.params.h_min,
+            engine.params.h_max,
+            Some(engine.params.maintenance_margin_bps as u128),
+        )?;
         let h_lock = engine.params.h_min;
-        engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot, funding_rate_e9, h_lock, engine.params.h_max, None)
+        // PORT-21 (HIGH SF): pass `Some(maintenance_margin_bps)` to the
+        // engine's admit-threshold parameter (was `None`). The threshold
+        // makes admission gate against maintenance margin during the
+        // convert operation.
+        engine
+            .convert_released_pnl_not_atomic(
+                user_idx,
+                units as u128,
+                price,
+                clock.slot,
+                funding_rate_e9,
+                h_lock,
+                engine.params.h_max,
+                Some(engine.params.maintenance_margin_bps as u128),
+            )
             .map_err(map_risk_error)?;
         if !state::is_oracle_initialized(&data) {
             state::set_oracle_initialized(&mut data);
