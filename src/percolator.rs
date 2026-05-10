@@ -8286,6 +8286,18 @@ pub mod processor {
 
         let clock = Clock::from_account_info(a_clock)?;
 
+        // PORT-7a / Hunk 1 (HIGH SF): hard-timeout reject + envelope
+        // check. Pure-deposit is still a live mutation. Once the market
+        // has matured into the permissionless-resolve window, no further
+        // mutations are permitted (even before ResolvePermissionless has
+        // run). The envelope check rejects materialization when the
+        // engine clock is outside `max_accrual_dt_slots` of wallclock and
+        // there's exposed OI — caller must catchup-crank first.
+        if oracle::permissionless_stale_matured(&config, clock.slot) {
+            return Err(PercolatorError::OracleStale.into());
+        }
+        check_no_oracle_live_envelope(zc::engine_ref(&data)?, clock.slot)?;
+
         // Reject misaligned deposits — dust would be silently donated
         let (_units_check, dust_check) = crate::units::base_to_units(fee_payment, config.unit_scale);
         if dust_check != 0 {
@@ -8305,6 +8317,10 @@ pub mod processor {
         // the deposit is large enough to spare it. This restores the
         // conservation invariant tests expect:
         //   capital = payment - 1, insurance += 1.
+        // PORT-23/PORT-7 follow-up (FIX-N): fork's hardcoded 1-unit fee
+        // is the DRIFT-HIGH partial fix for the missing
+        // config.new_account_fee field; restoring the field is deferred
+        // to FIX-N work.
         const ANTI_SPAM_FEE_UNITS: u128 = 1;
         let total_units = units as u128;
         let (capital_units, fee_units) = if total_units > ANTI_SPAM_FEE_UNITS {
@@ -8312,6 +8328,28 @@ pub mod processor {
         } else {
             (total_units, 0)
         };
+
+        // PORT-8 / Hunk 2 (HIGH SF): TVL/insurance cap simulation.
+        // Reject deposits that would push c_tot beyond
+        // `tvl_insurance_cap_mult * insurance_fund.balance`. ADAPTED to
+        // fork's pre-existing capital_units/fee_units split (the toly
+        // version simulates fee_base+capital_base from the
+        // new_account_fee schema; fork uses ANTI_SPAM_FEE_UNITS until
+        // FIX-N restores the field). When tvl_insurance_cap_mult == 0
+        // the cap is disabled (default).
+        if config.tvl_insurance_cap_mult > 0 {
+            let engine_r = zc::engine_ref(&data)?;
+            let ins_new = engine_r
+                .insurance_fund
+                .balance
+                .get()
+                .saturating_add(fee_units);
+            let c_tot_new = engine_r.c_tot.get().saturating_add(capital_units);
+            let cap = ins_new.saturating_mul(config.tvl_insurance_cap_mult as u128);
+            if c_tot_new > cap {
+                return Err(PercolatorError::DepositCapExceeded.into());
+            }
+        }
 
         let clock_for_fund = clock.slot;
         let engine = zc::engine_mut(&mut data)?;
@@ -8381,6 +8419,13 @@ pub mod processor {
 
         let clock = Clock::from_account_info(a_clock)?;
 
+        // PORT-7b / Hunk 1 (HIGH SF): hard-timeout reject + envelope
+        // check. See InitUser PORT-7a comment for rationale.
+        if oracle::permissionless_stale_matured(&config, clock.slot) {
+            return Err(PercolatorError::OracleStale.into());
+        }
+        check_no_oracle_live_envelope(zc::engine_ref(&data)?, clock.slot)?;
+
         // Reject misaligned deposits — dust would be silently donated
         let (_units_check, dust_check) = crate::units::base_to_units(fee_payment, config.unit_scale);
         if dust_check != 0 {
@@ -8401,6 +8446,22 @@ pub mod processor {
         } else {
             (total_units, 0)
         };
+
+        // PORT-8 / Hunk 2 (HIGH SF): TVL/insurance cap simulation.
+        // See InitUser PORT-8 comment for rationale.
+        if config.tvl_insurance_cap_mult > 0 {
+            let engine_r = zc::engine_ref(&data)?;
+            let ins_new = engine_r
+                .insurance_fund
+                .balance
+                .get()
+                .saturating_add(fee_units);
+            let c_tot_new = engine_r.c_tot.get().saturating_add(capital_units);
+            let cap = ins_new.saturating_mul(config.tvl_insurance_cap_mult as u128);
+            if c_tot_new > cap {
+                return Err(PercolatorError::DepositCapExceeded.into());
+            }
+        }
 
         let clock_for_fund = clock.slot;
         let engine = zc::engine_mut(&mut data)?;
@@ -8473,6 +8534,13 @@ pub mod processor {
 
         let clock = Clock::from_account_info(a_clock)?;
 
+        // PORT-7c / Hunk 1 (HIGH SF): hard-timeout reject + envelope
+        // check. See InitUser PORT-7a comment for rationale.
+        if oracle::permissionless_stale_matured(&config, clock.slot) {
+            return Err(PercolatorError::OracleStale.into());
+        }
+        check_no_oracle_live_envelope(zc::engine_ref(&data)?, clock.slot)?;
+
         // Reject misaligned deposits — dust would be silently donated
         let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
         if dust_check != 0 {
@@ -8484,6 +8552,20 @@ pub mod processor {
 
         // Convert base tokens to units for engine
         let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
+
+        // PORT-8 / Hunk 2 (HIGH SF): TVL/insurance cap simulation.
+        // DepositCollateral has no fee split — entire amount is capital
+        // (no anti-spam fee on re-deposits). See InitUser PORT-8 comment
+        // for the cap rationale.
+        if config.tvl_insurance_cap_mult > 0 {
+            let engine_r = zc::engine_ref(&data)?;
+            let ins_new = engine_r.insurance_fund.balance.get();
+            let c_tot_new = engine_r.c_tot.get().saturating_add(units as u128);
+            let cap = ins_new.saturating_mul(config.tvl_insurance_cap_mult as u128);
+            if c_tot_new > cap {
+                return Err(PercolatorError::DepositCapExceeded.into());
+            }
+        }
 
         let engine = zc::engine_mut(&mut data)?;
 
