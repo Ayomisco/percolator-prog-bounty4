@@ -7464,8 +7464,17 @@ pub mod processor {
                 funding_max_e9_per_slot,
                 tvl_insurance_cap_mult,
             } => {
-                let _ = tvl_insurance_cap_mult;
-                handle_update_config(program_id, accounts, funding_horizon_slots, funding_k_bps, funding_max_premium_bps, funding_max_e9_per_slot)?;
+                // PORT-6 (HIGH SF): persist tvl_insurance_cap_mult through to
+                // the handler instead of dropping it at dispatch.
+                handle_update_config(
+                    program_id,
+                    accounts,
+                    funding_horizon_slots,
+                    funding_k_bps,
+                    funding_max_premium_bps,
+                    funding_max_e9_per_slot,
+                    tvl_insurance_cap_mult,
+                )?;
             }
 
             Instruction::SetOraclePriceCap { max_change_e2bps } => {
@@ -10136,6 +10145,7 @@ pub mod processor {
 
     // --- UpdateConfig ---
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn handle_update_config<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
@@ -10143,20 +10153,19 @@ pub mod processor {
         funding_k_bps: u64,
         funding_max_premium_bps: i64,
         funding_max_bps_per_slot: i64,
+        tvl_insurance_cap_mult: u16,
     ) -> ProgramResult {
-        // v12.19 cluster sweep: SDK + several test sites pass 4 accounts
-        // (admin, slab, clock, oracle) because non-Hyperp accrual was thought
-        // to need a fresh oracle read. The wrapper actually uses the engine's
-        // stored `last_oracle_price`, so the oracle account is unused — but
-        // strict expect_len(3) rejected the 4-account form. Accept either 3
-        // or 4 accounts; treat the 4th slot as a documented no-op for SDK
-        // ergonomics.
-        if accounts.len() != 3 && accounts.len() != 4 {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        }
+        // PORT-4 / Hunk 1 (HIGH SF): strict 4-account list. Was previously
+        // 3-or-4, with the 4th slot documented as a no-op — that "degenerate
+        // by omission" form let admin issue UpdateConfig without an oracle
+        // and accrue against engine's stale `last_oracle_price`. Toly's
+        // expect_len(4) closes that escape hatch; the oracle is now a
+        // required input for non-Hyperp accrual (see PORT-5).
+        accounts::expect_len(accounts, 4)?;
         let a_admin = &accounts[0];
         let a_slab = &accounts[1];
         let a_clock = &accounts[2];
+        let a_oracle = &accounts[3];
 
         accounts::expect_signer(a_admin)?;
         accounts::expect_writable(a_slab)?;
@@ -10174,13 +10183,18 @@ pub mod processor {
         if funding_horizon_slots == 0 {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
-        // Reject negative funding bounds — reversed clamp bounds panic.
-        /* fix: ML10 renamed funding_max_bps_per_slot → funding_max_e9_per_slot.
-         * `funding_max_bps_per_slot` (param name kept for ABI continuity) is
-         * already in e9; do NOT pass through funding_bps_to_e9. */
-        if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0
-            || (funding_max_bps_per_slot as i128) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT
-        {
+        // PORT Hunk 2 (HIGH SF): per-market funding envelope check.
+        // Was previously bounded by `percolator::MAX_ABS_FUNDING_E9_PER_SLOT`
+        // (crate-global ceiling); now bounded by the per-market
+        // engine.params.max_abs_funding_e9_per_slot which may be tighter.
+        // Without this, fork accepted values higher than the engine
+        // tolerates, causing later accrue_market_to to reject with
+        // Overflow / InvalidConfigParam mid-handler.
+        if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        let engine_envelope = zc::engine_ref(&data)?.params.max_abs_funding_e9_per_slot;
+        if (funding_max_bps_per_slot as i128) > engine_envelope as i128 {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
 
@@ -10194,8 +10208,25 @@ pub mod processor {
         // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
         let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
 
-        // Flush Hyperp index WITHOUT staleness check (admin recovery path).
         let clock = Clock::from_account_info(a_clock)?;
+
+        // PORT Hunk 3 (HIGH SF): hard-timeout gate. UpdateConfig must not
+        // mutate a terminally-stale market — admin has no "emergency
+        // reconfigure" path past the hard timeout. Without this, admin
+        // could retroactively shape funding outcomes for users mid-exit
+        // on a market that should be in withdraw-only via
+        // ResolvePermissionless.
+        if oracle::permissionless_stale_matured(&config, clock.slot) {
+            return Err(PercolatorError::OracleStale.into());
+        }
+
+        // Flush Hyperp index WITHOUT staleness check (admin recovery path).
+        // PERCOLATOR-FORK-SPECIFIC: KEEP fork's `clamp_toward_with_dt` +
+        // `config.oracle_price_cap_e2bps` cap source per KL-FORK-ENGINE-FIELDS
+        // / F-B3 overhaul. Toly uses `clamp_toward_engine_dt` +
+        // `engine.params.max_price_move_bps_per_slot` (a bps value); fork's
+        // helper expects e2bps under the F-B3 overhaul, so the toly cap
+        // source would be 100x off-scale (Hunk 4 deferred).
         if oracle::is_hyperp_mode(&config) {
             let prev_index = config.last_effective_price_e6;
             let mark = config.mark_ewma_e6;
@@ -10210,22 +10241,46 @@ pub mod processor {
             }
             state::write_config(&mut data, &config);
         }
-        // Accrue to boundary using engine's already-stored rate.
-        // Do NOT overwrite funding_rate_bps_per_slot_last before accrual —
-        // that would retroactively reprice the elapsed interval.
-        // Both Hyperp and non-Hyperp must accrue before changing funding params.
+
+        // PORT-5 / Hunk 5 (HIGH SF): live-oracle accrual order. For
+        // non-Hyperp markets, READ a fresh oracle (propagating
+        // OracleStale / OracleConfTooWide), then run
+        // reject_stuck_target_accrual + reject_account_limited +
+        // catchup_accrue + accrue_market_to. Replaces fork's prior path
+        // which used engine's cached `last_oracle_price` and bypassed
+        // all gates — admin could erase elapsed funding by omitting the
+        // oracle, accruing against a config-controlled rate against a
+        // stale anchor.
         {
-            let accrual_price = if oracle::is_hyperp_mode(&config) {
-                config.last_effective_price_e6
-            } else {
-                // Non-Hyperp: use last oracle price from engine
-                let engine = zc::engine_ref(&data)?;
-                engine.last_oracle_price
-            };
+            let (accrual_price, rate_for_accrual): (u64, i128) =
+                if oracle::is_hyperp_mode(&config) {
+                    (config.last_effective_price_e6, funding_rate_e9)
+                } else {
+                    let live = read_price_and_stamp(
+                        &mut config,
+                        a_oracle,
+                        clock.unix_timestamp,
+                        clock.slot,
+                        Some(&mut data),
+                    )?;
+                    state::write_config(&mut data, &config);
+                    (live, funding_rate_e9)
+                };
             if accrual_price > 0 {
-                let engine = zc::engine_mut(&mut data)?;
-                engine.accrue_market_to(clock.slot, accrual_price, funding_rate_e9)
-                    .map_err(map_risk_error)?;
+                {
+                    let engine = zc::engine_mut(&mut data)?;
+                    reject_stuck_target_accrual(&config, engine, clock.slot, accrual_price)?;
+                    reject_account_limited_market_progress(
+                        engine, clock.slot, accrual_price, rate_for_accrual,
+                    )?;
+                    catchup_accrue(engine, clock.slot, accrual_price, rate_for_accrual)?;
+                    engine
+                        .accrue_market_to(clock.slot, accrual_price, rate_for_accrual)
+                        .map_err(map_risk_error)?;
+                }
+                if !state::is_oracle_initialized(&data) {
+                    state::set_oracle_initialized(&mut data);
+                }
             }
         }
 
@@ -10233,6 +10288,11 @@ pub mod processor {
         config.funding_k_bps = funding_k_bps;
         config.funding_max_premium_bps = funding_max_premium_bps;
         config.funding_max_e9_per_slot = funding_max_bps_per_slot;
+        // PORT-6 / Hunk 6 (HIGH SF): persist tvl_insurance_cap_mult.
+        // Was previously parsed from the wire and dropped at dispatch
+        // (`let _ = tvl_insurance_cap_mult;`); admin's TVL cap update
+        // was silently ignored.
+        config.tvl_insurance_cap_mult = tvl_insurance_cap_mult;
         // Run end-of-instruction lifecycle after accrue + config change.
         // Finalizes pending resets triggered by the accrual.
         {
