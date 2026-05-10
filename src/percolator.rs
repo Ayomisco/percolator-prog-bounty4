@@ -9751,7 +9751,14 @@ pub mod processor {
         verify_token_account(a_user_ata, a_user.key, &mint)?;
         accounts::expect_key(a_pda, &auth)?;
 
-        let resolved = state::is_resolved(&data);
+        // PORT-26 (SF MEDIUM): read resolved gate from engine.market_mode
+        // (authoritative) instead of fork's wrapper FLAG_RESOLVED bit.
+        // The two are kept in sync after PORT-1/PORT-2 (Tag 19/29 layer
+        // state::set_resolved AFTER engine.resolve_market_not_atomic), but
+        // the engine field is the source of truth and avoids any partial-
+        // resolution desync window.
+        let resolved = zc::engine_ref(&data)?.market_mode
+            == percolator::MarketMode::Resolved;
         let clock = Clock::from_account_info(&accounts[6])?;
         // Anti-retroactivity: capture funding rate before oracle read (§5.5)
         let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
@@ -10055,8 +10062,11 @@ pub mod processor {
             slab_guard(program_id, a_slab, &data)?;
             require_initialized(&data)?;
 
-            // Require resolved — enforce lifecycle ordering
-            if !state::is_resolved(&data) {
+            // PORT-26 (SF MEDIUM): require resolved via engine.market_mode
+            // (authoritative source of truth). See Tag 8 PORT-26 comment.
+            if zc::engine_ref(&data)?.market_mode
+                != percolator::MarketMode::Resolved
+            {
                 return Err(ProgramError::InvalidAccountData);
             }
 
