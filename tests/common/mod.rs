@@ -113,14 +113,16 @@ pub const DEFAULT_INIT_CAPITAL: u64 = DEFAULT_INIT_PAYMENT - DEFAULT_NEW_ACCOUNT
 // All `+N` offsets in this file are measured from `ENGINE_OFFSET` and
 // already account for this padding implicitly.
 pub const ENGINE_OFFSET: usize = 600;
-// v12.19 layout (RiskParams expanded by ~16 bytes pushed downstream
-// fields). Probed via tests/probe_offset.rs against the small build
-// (MAX_ACCOUNTS=256). num_used_accounts is a u16 inside the fixed
-// engine prefix (offset feature-invariant).
-// v12.19: bitmap shifted from engine+712 → engine+728 (probed via
-// tests/probe_offset.rs; 3 used slots → word 0 = 7).
-pub const ENGINE_BITMAP_OFFSET: usize = 728;
-pub const ENGINE_NUM_USED_OFFSET: usize = 592;
+// v12.19 layout — DEFAULT build (MAX_ACCOUNTS=4096, no features).
+// Probed empirically via tests/probe_offset.rs::probe_num_used_accounts_offset:
+//   bitmap u64=7  → slab[1736] → engine+1136
+//   u16=3 (num_used_accounts) → slab[2248] → engine+1648
+// These are NOT feature-invariant: RiskParams.h_max_sticky_bitmap is
+// [u64; BITMAP_WORDS] where BITMAP_WORDS = MAX_ACCOUNTS/64, so bitmap
+// size scales with MAX_ACCOUNTS, pushing num_used_accounts downstream.
+// Small build (MAX_ACCOUNTS=256) had bitmap=32 bytes → engine+728/+592.
+pub const ENGINE_BITMAP_OFFSET: usize = 1136;
+pub const ENGINE_NUM_USED_OFFSET: usize = 1648;
 
 // ENGINE_ACCOUNTS_OFFSET = end of bitmap + per-slot K/F arrays. Scales
 // with MAX_ACCOUNTS. small probed at engine+17632; medium/default need
@@ -2198,9 +2200,9 @@ impl TestEnv {
     /// Read num_used_accounts from engine state
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // v12.19: num_used_accounts u16 at engine+592 (probed; was at +1224
-        // in v12.17 before the engine field reordering).
-        pub const NUM_USED_OFFSET: usize = 600 + 592;
+        // DEFAULT build (MAX_ACCOUNTS=4096): num_used_accounts at engine+1648.
+        // Probed empirically (probe_num_used_accounts_offset) — NOT feature-invariant.
+        pub const NUM_USED_OFFSET: usize = ENGINE_OFFSET + ENGINE_NUM_USED_OFFSET;
         if slab_account.data.len() < NUM_USED_OFFSET + 2 {
             return 0;
         }
@@ -2306,9 +2308,9 @@ impl TestEnv {
     /// Check if a slot is marked as used in the bitmap
     pub fn is_slot_used(&self, idx: u16) -> bool {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // v12.19: bitmap u64 array at engine+728 (probed empirically;
-        // shifted from +712 by the engine field reordering).
-        pub const BITMAP_OFFSET: usize = 600 + 728;
+        // DEFAULT build (MAX_ACCOUNTS=4096): bitmap at engine+1136.
+        // Probed empirically (probe_num_used_accounts_offset) — NOT feature-invariant.
+        pub const BITMAP_OFFSET: usize = ENGINE_OFFSET + ENGINE_BITMAP_OFFSET;
         let word_idx = (idx as usize) >> 6; // idx / 64
         let bit_idx = (idx as usize) & 63; // idx % 64
         let word_offset = BITMAP_OFFSET + word_idx * 8;
@@ -4643,8 +4645,8 @@ impl TradeCpiTestEnv {
 
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // v12.19: ENGINE_OFFSET=600, num_used_accounts u16 at engine+592.
-        const OFF: usize = 600 + 592;
+        // DEFAULT build (MAX_ACCOUNTS=4096): num_used_accounts at engine+1648.
+        const OFF: usize = ENGINE_OFFSET + ENGINE_NUM_USED_OFFSET;
         u16::from_le_bytes(slab_data[OFF..OFF + 2].try_into().unwrap())
     }
 
@@ -4676,13 +4678,17 @@ impl TradeCpiTestEnv {
     /// Read vault balance from slab
     pub fn read_vault(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // vault is at offset 0 within RiskEngine
-        pub const VAULT_OFFSET: usize = 584;
-        u128::from_le_bytes(
-            slab_data[VAULT_OFFSET..VAULT_OFFSET + 16]
-                .try_into()
-                .unwrap(),
-        )
+        // BPF ENGINE_OFF = 616 (probed: vault found at slab[616]).
+        // Engine start is 16 bytes past ENGINE_OFFSET(600) because BPF uses
+        // 8-byte alignment while x86_64 compile sees 16-byte align for u128.
+        // All other ENGINE_OFFSET+X reads accidentally compensate: their X was
+        // measured as (slab_pos - 600) = (616 + struct_off - 600) = struct_off+16,
+        // so 600+(struct_off+16) = correct. Vault (struct_off=0) has no +16 term.
+        pub const VAULT_OFFSET: usize = 616;
+        // U128 in BPF = [lo:u64, hi:u64]. Read as u128 LE (same byte order).
+        let lo = u64::from_le_bytes(slab_data[VAULT_OFFSET..VAULT_OFFSET+8].try_into().unwrap());
+        let hi = u64::from_le_bytes(slab_data[VAULT_OFFSET+8..VAULT_OFFSET+16].try_into().unwrap());
+        (lo as u128) | ((hi as u128) << 64)
     }
 
     /// Read account PnL

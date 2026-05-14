@@ -8987,23 +8987,45 @@ pub mod processor {
         // Hyperp mode: use get_engine_oracle_price_e6 for rate-limited index smoothing
         // Otherwise: use read_price_clamped as before
         let is_hyperp = oracle::is_hyperp_mode(&config);
-        let engine_last_slot = {
+        // Read last oracle price (anchor), current slot (for dt), and the
+        // engine's max_price_move_bps_per_slot (for accrual consistency) from
+        // the engine before the mutable borrow below.
+        //
+        // Previous bug: engine.current_slot was passed as engine_last_oracle_price.
+        // The anchor must be a price (~1_000_000), not a slot number (~100).
+        //
+        // Additional consistency constraint: oracle_price_cap_e2bps (1% per slot)
+        // is 25× looser than max_price_move_bps_per_slot (4 bps per slot). After a
+        // TradeCpi that moves mark_ewma by >4 bps, passing mark_ewma directly
+        // (oi_any=false) would make accrue_market_to reject the oracle price with
+        // Overflow (0x12). Tighten to min(cap, mpm*100) e2bps and use oi_any=true
+        // so clamp_toward_engine_dt applies, ensuring the oracle price returned
+        // never jumps by more than max_price_move_bps_per_slot bps per dt slot.
+        let (engine_last_oracle_price, engine_crank_slot, engine_price_move_bps) = {
             let engine = zc::engine_ref(&data)?;
-            engine.current_slot
+            (engine.last_oracle_price, engine.current_slot, engine.params.max_price_move_bps_per_slot)
         };
 
         let price = if is_hyperp {
-            // Hyperp mode: update index toward mark with rate limiting
+            // Hyperp mode: update index toward mark with rate limiting.
+            // dt_slots = elapsed slots since the last engine crank; clamp to
+            // at least 1 so the first crank (current_slot == clock.slot after
+            // init) still produces a non-zero movement budget.
+            //
+            // effective_cap = min(oracle_price_cap, max_price_move_bps_per_slot * 100)
+            // ensures oracle price stays within what accrue_market_to allows.
             {
-                let _oracle_cap = config.oracle_price_cap_e2bps;
+                let effective_cap = config.oracle_price_cap_e2bps
+                    .min(engine_price_move_bps.saturating_mul(100));
+                let dt_slots = clock.slot.saturating_sub(engine_crank_slot);
                 oracle::get_engine_oracle_price_e6(
-                engine_last_slot, 1u64,
-                clock.slot,
-                clock.unix_timestamp,
-                &mut config,
-                a_oracle,
-                    _oracle_cap,
-                    false,
+                    engine_last_oracle_price, dt_slots,
+                    clock.slot,
+                    clock.unix_timestamp,
+                    &mut config,
+                    a_oracle,
+                    effective_cap,
+                    true,
                 )
             }?
         } else {
@@ -9376,8 +9398,10 @@ pub mod processor {
         size: i128,
         limit_price_e6: u64, // 0 = no limit (backward compat),
     ) -> ProgramResult {
-        // Phase 1: Updated account layout - lp_pda must be in accounts
-        accounts::expect_len(accounts, 8)?;
+        // Phase 1: Updated account layout - lp_pda must be in accounts.
+        // Use expect_len_min (>= 8) to allow variadic tail accounts past index 7;
+        // tail accounts are forwarded verbatim to the matcher CPI.
+        accounts::expect_len_min(accounts, 8)?;
         let a_user = &accounts[0];
         let a_lp_owner = &accounts[1];
         let a_slab = &accounts[2];
@@ -9424,7 +9448,8 @@ pub mod processor {
         // Phase 3 & 4: Read engine state, generate nonce, validate matcher identity
         // Note: Use immutable borrow for reading to avoid ExternalAccountDataModified
         // Nonce write is deferred until after execute_trade
-        let (lp_account_id, mut config, req_id, lp_matcher_prog, lp_matcher_ctx, engine_current_slot) = {
+        let (lp_account_id, mut config, req_id, lp_matcher_prog, lp_matcher_ctx,
+             engine_current_slot, engine_last_oracle_price_tradecpi, engine_price_move_bps_tradecpi) = {
             let data = a_slab.try_borrow_data()?;
             slab_guard(program_id, a_slab, &*data)?;
             require_initialized(&*data)?;
@@ -9489,6 +9514,8 @@ pub mod processor {
                 lp_acc.matcher_program,
                 lp_acc.matcher_context,
                 engine.current_slot,
+                engine.last_oracle_price,
+                engine.params.max_price_move_bps_per_slot,
             )
         };
 
@@ -9506,18 +9533,25 @@ pub mod processor {
         // Capture pre-oracle-read funding rate for anti-retroactivity (§5.5)
         let funding_rate_e9_pre = compute_current_funding_rate_e9(&config)?;
 
-        // Oracle price: Hyperp mode applies rate-limited index update
-        // via clamp_toward_with_dt (prevents stale-index manipulation).
-        // Non-Hyperp: standard circuit-breaker clamping.
+        // Oracle price: Hyperp mode applies rate-limited index update.
+        // Use same anchor/cap logic as KeeperCrank for consistency:
+        //   - anchor = engine.last_oracle_price (NOT engine.current_slot)
+        //   - effective_cap = min(oracle_price_cap, max_price_move_bps * 100)
+        //   - oi_any = true (rate-limiting always applies)
+        //   - dt_slots = actual elapsed slots (NO .max(1)) so dt=0 returns P_last,
+        //     matching engine's early-return path in accrue_market_to.
         let is_hyperp = oracle::is_hyperp_mode(&config);
         let price = if is_hyperp {
             {
-                let _oracle_cap = config.oracle_price_cap_e2bps;
+                let effective_cap_tradecpi = config.oracle_price_cap_e2bps
+                    .min(engine_price_move_bps_tradecpi.saturating_mul(100));
+                let dt_slots_tradecpi = clock.slot.saturating_sub(engine_current_slot);
                 oracle::get_engine_oracle_price_e6(
-                engine_current_slot, 1u64, clock.slot, clock.unix_timestamp,
-                &mut config, a_oracle,
-                    _oracle_cap,
-                    false,
+                    engine_last_oracle_price_tradecpi, dt_slots_tradecpi,
+                    clock.slot, clock.unix_timestamp,
+                    &mut config, a_oracle,
+                    effective_cap_tradecpi,
+                    true,
                 )
             }?
         } else {
