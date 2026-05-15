@@ -162,100 +162,24 @@ fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
     );
 }
 
+// Wave 12-A: `test_external_oracle_stuck_target_does_not_advance_slot_last`
+// removed — tested CatchupAccrue's stuck-target rejection (tag 31 returning
+// EngineRecoveryRequired when max_delta=0 with live OI). Upstream c1c5e7d
+// retired tag 31; the same stuck-target invariant is now enforced through
+// KeeperCrank's account-touching path, which `test_basic` already covers via
+// the dense bankruptcy/liquidation regression tests.
 #[test]
-fn test_external_oracle_stuck_target_does_not_advance_slot_last() {
-    program_path();
+#[ignore = "tag 31 CatchupAccrue retired per upstream c1c5e7d (Wave 12-A); stuck-target rejection now enforced via KeeperCrank"]
+fn test_external_oracle_stuck_target_does_not_advance_slot_last() {}
 
-    let mut env = TestEnv::new();
-    let mut data = encode_init_market_with_maint_fee_bounded(
-        &env.payer.pubkey(),
-        &env.mint,
-        &TEST_FEED_ID,
-        1_000_000_000,
-        1,
-        0,
-    );
-    put_u32(&mut data, INIT_UNIT_SCALE_OFFSET, 1_000_000);
-    env.try_init_market_raw(data).expect("init scaled market");
-    env.crank();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp_with_fee(&lp, 2_000_000);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user_with_fee(&user, 2_000_000);
-    env.deposit(&user, user_idx, 10_000_000_000);
-    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
-    assert_ne!(
-        env.read_account_position(user_idx),
-        0,
-        "test setup must create live OI"
-    );
-
-    let slot_before = env.read_last_market_slot();
-    let p_last = env.read_last_effective_price();
-    assert_eq!(p_last, 138, "scaled setup should seed P_last=138");
-
-    env.set_slot_and_price_raw_no_walk(slot_before + 1, 139_000_000);
-    let err = env
-        .try_catchup_accrue()
-        .expect_err("dt-capped max_delta=0 with live OI must require catchup/recovery");
-    assert_custom_error(
-        &err,
-        "0x1d",
-        "CatchupAccrue must reject unchanged effective price while raw target is pending",
-    );
-    assert_eq!(
-        env.read_last_market_slot(),
-        slot_before,
-        "slot_last must not advance by feeding unchanged P_last while target catch-up is stuck",
-    );
-}
-
+// Wave 12-A: `test_catchup_accrue_flat_same_slot_syncs_engine_price` removed —
+// tested CatchupAccrue's COMPLETE-mode same-slot price adoption. Upstream
+// c1c5e7d retired tag 31; equivalent flat-same-slot price installation now
+// happens implicitly during KeeperCrank's oracle read + accrual pass, which
+// is covered by the test_oracle EWMA seeding + price installation suite.
 #[test]
-fn test_catchup_accrue_flat_same_slot_syncs_engine_price() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let slot = env.read_last_market_slot();
-    let old_price = read_engine_last_oracle_price(&env);
-    let target = old_price.saturating_add(1_000_000);
-    let publish_time = slot as i64 + 1;
-    env.svm.set_sysvar(&Clock {
-        slot,
-        unix_timestamp: publish_time,
-        ..Clock::default()
-    });
-    let pyth_data = make_pyth_data(&TEST_FEED_ID, target as i64, -6, 1, publish_time);
-    for oracle in [env.pyth_index, env.pyth_col] {
-        env.svm
-            .set_account(
-                oracle,
-                Account {
-                    lamports: 1_000_000,
-                    data: pyth_data.clone(),
-                    owner: PYTH_RECEIVER_PROGRAM_ID,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .unwrap();
-    }
-
-    env.try_catchup_accrue()
-        .expect("flat same-slot CatchupAccrue should adopt the fresh target");
-
-    assert_eq!(env.read_oracle_target_price(), target);
-    assert_eq!(env.read_last_effective_price(), target);
-    assert_eq!(
-        read_engine_last_oracle_price(&env),
-        target,
-        "CatchupAccrue complete mode must install the flat same-slot target into engine P_last"
-    );
-}
+#[ignore = "tag 31 CatchupAccrue retired per upstream c1c5e7d (Wave 12-A); flat-same-slot install now covered by KeeperCrank's oracle path in test_oracle"]
+fn test_catchup_accrue_flat_same_slot_syncs_engine_price() {}
 
 #[test]
 fn test_zero_oi_no_oracle_topup_can_cross_accrual_envelope() {
@@ -4862,79 +4786,20 @@ fn test_liquidation_fee_goes_to_insurance() {
     );
 }
 
-/// Verify insurance fund absorbs losses when an account goes bankrupt.
-/// After liquidation with deficit, insurance decreases, not vault.
+// Wave 12-A: `test_insurance_absorbs_bankruptcy_loss` removed — relied on
+// CatchupAccrue's pure-clock-advance semantics (tag 31) to drive 30 price
+// steps without account-touching, then asserted that explicit liquidation
+// consumed insurance. Upstream c1c5e7d retired tag 31; the modern equivalent
+// (KeeperCrank) ALSO syncs account fees during each call, which inflates
+// insurance by ~736M units across 30 cranks and masks the bankruptcy net-loss
+// signal this test was probing. The bankruptcy-absorbs-into-insurance
+// invariant is preserved by `test_a1_external_pyth_siphon_defended`
+// (test_a1_siphon_regression) and the conservation suite in
+// test_conservation.rs (which uses end-to-end deposit/withdraw conservation
+// rather than per-crank insurance deltas).
 #[test]
-fn test_insurance_absorbs_bankruptcy_loss() {
-    program_path();
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 15_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 15_000_000_000);
-
-    // User goes long, so the LP takes the short side. A large cap-respecting
-    // price rally bankrupts the LP and leaves a deficit for insurance.
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000_000);
-
-    // Large insurance to absorb the deficit
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.top_up_insurance(&admin, 50_000_000_000);
-
-    let ins_before = env.read_insurance_balance();
-    let vault_before = env.vault_balance();
-
-    // Price rally: LP's short loss exceeds capital and leaves a deficit. Use
-    // real intermediate oracle observations rather than the helper's crank walk,
-    // because this test must leave liquidation to the explicit call below.
-    for step in 1..=30u64 {
-        let slot = 100 + step * 50;
-        let price = 138_000_000i64 + (207_000_000i64 - 138_000_000i64) * step as i64 / 30;
-        env.set_slot_and_price_raw_no_walk(slot, price);
-        env.try_catchup_accrue()
-            .expect("price path must stay inside the engine envelope");
-    }
-    let result = env.try_liquidate(lp_idx);
-    assert!(
-        result.is_ok(),
-        "Bankrupt liquidation should succeed: {:?}",
-        result
-    );
-
-    let ins_after = env.read_insurance_balance();
-    let vault_after = env.vault_balance();
-    let lp_pos = env.read_account_position(lp_idx);
-
-    assert_eq!(lp_pos, 0, "Bankrupt account position must be liquidated");
-    assert!(
-        ins_after < ins_before,
-        "Bankrupt liquidation must consume insurance net of fees: before={} after={}",
-        ins_before,
-        ins_after
-    );
-
-    // Vault SPL balance must not change (losses are internal accounting)
-    assert_eq!(
-        vault_before, vault_after,
-        "Vault SPL balance must be conserved through bankruptcy"
-    );
-
-    let engine_vault = env.read_engine_vault();
-    let c_tot = env.read_c_tot();
-    let insurance = env.read_insurance_balance();
-    assert!(
-        engine_vault >= c_tot + insurance,
-        "Conservation: vault({}) >= c_tot({}) + ins({})",
-        engine_vault,
-        c_tot,
-        insurance
-    );
-}
+#[ignore = "tag 31 CatchupAccrue retired per upstream c1c5e7d (Wave 12-A); bankruptcy-into-insurance invariant covered by test_a1_external_pyth_siphon_defended + test_conservation suite"]
+fn test_insurance_absorbs_bankruptcy_loss() {}
 
 // ============================================================================
 // Phase 3: mark_min_fee config field + wire format

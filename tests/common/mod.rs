@@ -1915,7 +1915,9 @@ pub fn encode_resolve_permissionless() -> Vec<u8> {
     vec![29u8]
 }
 
-/// Tag 31: CatchupAccrue — permissionless partial market-clock advance.
+/// Tag 31 retired per upstream c1c5e7d (Wave 12-A). Helper retained
+/// for tests that probe the decode-rejection path; emits the bare tag
+/// byte that the wrapper's decoder now rejects with InvalidInstructionData.
 pub fn encode_catchup_accrue() -> Vec<u8> {
     vec![31u8]
 }
@@ -3311,10 +3313,10 @@ impl TestEnv {
         self.try_resolve_permissionless_once()
     }
 
-    /// Tag 31: permissionless CatchupAccrue. Commits up to
-    /// CATCHUP_CHUNKS_MAX chunks of market-clock advancement. Requires
-    /// a live oracle (proves market is live; dead oracles must use
-    /// ResolvePermissionless instead).
+    /// Tag 31 (CatchupAccrue) retired per upstream c1c5e7d (Wave 12-A).
+    /// This helper now exercises the decode-rejection path: callers should
+    /// expect `Err(InvalidInstructionData)`. Public market-clock progress
+    /// is routed through `try_crank` / `try_keeper_crank_internal`.
     pub fn try_catchup_accrue(&mut self) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
@@ -4251,10 +4253,11 @@ impl TradeCpiTestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
+    /// Tag 31 (CatchupAccrue) retired per upstream c1c5e7d (Wave 12-A).
+    /// Helper retained for the decode-rejection probe; expect Err.
     pub fn try_catchup_accrue(&mut self) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
-        // CatchupAccrue takes [slab, clock, oracle] — no caller account.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![

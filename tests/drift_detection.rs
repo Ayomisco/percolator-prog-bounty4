@@ -625,16 +625,16 @@ fn assert_decode_err(data: &[u8], msg: &str) {
     );
 }
 
-/// Tags 32, 33, 35, 36 are documented upstream-reserved gaps: they must
+/// Tags 31–33, 35, 36 are documented upstream-reserved gaps: they must
 /// return error. Tag 42 (SetInsuranceIsolation) was removed as a no-op
 /// stub and now also returns error at decode.
 #[test]
 fn gap_and_reserved_tags_return_invalid_instruction_data() {
-    // 31 = CatchupAccrue (Wave 7d Phase 3 — permissionless partial
-    //                      market-clock advance, ported from upstream)
+    // 31 = CatchupAccrue retired per upstream c1c5e7d (Wave 12-A).
+    //      Public market-clock progress is routed through KeeperCrank.
     // 34 = UpdateHyperpMark (now ported)
     // 42 = SetInsuranceIsolation removed (was no-op stub)
-    let no_arm_tags: &[u8] = &[32, 33, 35, 36, 42];
+    let no_arm_tags: &[u8] = &[31, 32, 33, 35, 36, 42];
     for &tag in no_arm_tags {
         assert_decode_err(
             &[tag],

@@ -1565,8 +1565,10 @@ pub mod error {
         AuditViolation,
         CrossMarginPairNotFound,
         InsufficientDexLiquidity,
-        // v12.18.1: caller's accrue path hit max_dt envelope and refuses to roll
-        // back; signals callers/keepers to use dedicated CatchupAccrue instead.
+        // Wrapper-level: the requested operation cannot safely advance market
+        // time. Caller must run KeeperCrank to commit account-touching market
+        // progress, then retry the original operation. (Upstream c1c5e7d
+        // retired the dedicated CatchupAccrue tag in favor of this routing.)
         CatchupRequired,
         /// Deposit rejected: post-deposit `c_tot` would exceed
         /// `tvl_insurance_cap_mult * insurance_fund.balance`.
@@ -1794,12 +1796,6 @@ pub mod ix {
         ForceCloseResolved {
             user_idx: u16,
         },
-
-        /// Permissionless partial market-clock advance (tag 31).
-        /// Commits up to CATCHUP_CHUNKS_MAX chunks of accrue_market_to without
-        /// a trailing main operation. Returns EngineRecoveryRequired when the
-        /// oracle price can't make forward progress (max_delta=0 with live OI).
-        CatchupAccrue,
 
         /// Permissionless Hyperp DEX EMA oracle update (tag 34).
         /// Reads DEX pool price (PumpSwap/Raydium CLMM/Meteora DLMM),
@@ -2309,7 +2305,11 @@ pub mod ix {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::ForceCloseResolved { user_idx })
                 }
-                31 => Ok(Instruction::CatchupAccrue),
+                // Tag 31 (CatchupAccrue) retired per upstream c1c5e7d.
+                // Public market-clock progress is routed through KeeperCrank
+                // so exposed markets get an account-touching revalidation/
+                // liquidation turn instead of an account-free fast-forward.
+                31 => Err(ProgramError::InvalidInstructionData),
                 34 => Ok(Instruction::UpdateHyperpMark),
                 76 => Ok(Instruction::PauseMarket),
                 77 => Ok(Instruction::UnpauseMarket),
@@ -6504,12 +6504,11 @@ pub mod processor {
 
     /// Maximum number of max_dt chunks the in-line catchup can advance per
     /// instruction. Bounded by CU budget — each `accrue_market_to` is cheap
-    /// but not free. For gaps beyond this, callers must use the dedicated
-    /// `CatchupAccrue` instruction which commits progress atomically
-    /// without attempting a main operation afterwards.
+    /// but not free. For gaps beyond this, callers must use KeeperCrank to
+    /// commit account-touching progress before attempting a main operation.
     ///
     /// 20 × max_dt = 20 × 100 = 2_000 slots per single instruction. Larger
-    /// gaps require multiple CatchupAccrue calls — that's the design
+    /// gaps require multiple KeeperCrank calls — that's the design
     /// contract, not a misconfig.
     const CATCHUP_CHUNKS_MAX: u32 = 20;
 
@@ -6539,7 +6538,7 @@ pub mod processor {
     /// idle interval "should have" been (which is unknowable).
     ///
     /// If the gap exceeds `CATCHUP_CHUNKS_MAX × max_dt`, returns `Err`
-    /// with `CatchupRequired` so the caller can surface "call CatchupAccrue
+    /// with `CatchupRequired` so the caller can surface "run KeeperCrank
     /// first" instead of silently returning Ok and letting the subsequent
     /// main engine call Overflow-and-rollback (which would discard the
     /// catchup progress too, making the market unrecoverable in-line).
@@ -6603,9 +6602,8 @@ pub mod processor {
                 // Silently returning Ok here would let the caller's
                 // main accrue hit Overflow on the residual, rolling
                 // back ALL catchup progress. Surface CatchupRequired
-                // so the caller routes to the dedicated CatchupAccrue
-                // instruction which commits progress without attempting
-                // the main op.
+                // so the caller routes to KeeperCrank, which commits
+                // account-touching progress before the main op is retried.
                 return Err(PercolatorError::CatchupRequired.into());
             }
             let chunk_dt = max_dt;
@@ -7721,10 +7719,6 @@ pub mod processor {
 
             Instruction::ForceCloseResolved { user_idx } => {
                 handle_force_close_resolved(program_id, accounts, user_idx)?;
-            }
-
-            Instruction::CatchupAccrue => {
-                handle_catchup_accrue(program_id, accounts)?;
             }
 
             // ─── Fork-specific instruction handlers ────────────────────────
@@ -12000,68 +11994,12 @@ pub mod processor {
         Ok(())
     }
 
-    // --- CatchupAccrue ---
-    #[inline(never)]
-    fn handle_catchup_accrue<'a>(
-        program_id: &Pubkey,
-        accounts: &'a [AccountInfo<'a>],
-    ) -> ProgramResult {
-        // Accounts: [slab(w), _unused, clock, _unused, oracle, _unused]
-        accounts::expect_len(accounts, 6)?;
-        let a_slab = &accounts[0];
-        let a_clock = &accounts[2];
-        let a_oracle = &accounts[4];
-        accounts::expect_writable(a_slab)?;
-
-        let mut data = state::slab_data_mut(a_slab)?;
-        slab_guard(program_id, a_slab, &data)?;
-        require_initialized(&data)?;
-        if state::is_resolved(&data) {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        let mut config = state::read_config(&data);
-        let clock = Clock::from_account_info(a_clock)?;
-        // Anti-retroactivity: capture funding rate before oracle read (§5.5)
-        let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
-        let price = read_price_and_stamp(
-            &mut config, a_oracle, clock.unix_timestamp, clock.slot, Some(&mut *data),
-        )?;
-        state::write_config(&mut data, &config);
-
-        // Detect stuck condition: oi_any + dt>0 + price moved + max_delta rounds to 0.
-        // Integer division floors max_delta=0 when price_bps*dt*prev < 10_000 (e.g.,
-        // small unit-scaled prices). The engine would Overflow on any non-zero price
-        // move in this state; return EngineRecoveryRequired so callers can surface
-        // "market needs admin recovery" instead of a misleading OracleInvalid.
-        {
-            let engine = zc::engine_ref(&data)?;
-            let prev = engine.last_oracle_price;
-            if prev > 0 && price != prev {
-                let dt = clock.slot.saturating_sub(engine.last_market_slot);
-                let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
-                if dt > 0 && oi_any {
-                    let cap_bps = engine.params.max_price_move_bps_per_slot;
-                    let max_delta = (prev as u128)
-                        .saturating_mul(cap_bps as u128)
-                        .saturating_mul(dt as u128)
-                        / 10_000;
-                    if max_delta == 0 {
-                        return Err(PercolatorError::EngineRecoveryRequired.into());
-                    }
-                }
-            }
-        }
-
-        let engine = zc::engine_mut(&mut data)?;
-        ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
-        drop(engine);
-
-        if !state::is_oracle_initialized(&data) {
-            state::set_oracle_initialized(&mut data);
-        }
-        Ok(())
-    }
+    // --- CatchupAccrue retired (upstream c1c5e7d, ported in Wave 12-A) ---
+    // Public market-clock progress is routed through KeeperCrank so exposed
+    // markets get an account-touching revalidation/liquidation turn instead
+    // of an account-free fast-forward. Tag 31 returns InvalidInstructionData
+    // at the decode layer; the dispatcher arm and `handle_catchup_accrue`
+    // function are removed accordingly.
 
     // --- ResolvePermissionless ---
     #[inline(never)]
