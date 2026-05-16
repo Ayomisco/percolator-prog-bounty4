@@ -274,6 +274,15 @@ pub mod constants {
     /// free markets (a zero value combined with envelope exhaustion
     /// would trap capital).
     pub const MIN_FUNDING_LIFETIME_SLOTS: u64 = 10_000_000;
+    /// Wave 12-F (port of upstream c175ec4): InitMarket wire flag packed
+    /// into `insurance_withdraw_max_bps` high bit. When set, tag 23
+    /// `WithdrawInsuranceLimited` can withdraw only explicit TopUpInsurance
+    /// principal; insurance growth from fees/liquidations remains behind.
+    /// Layered on top of fork tag 22 SetInsuranceWithdrawPolicy
+    /// (KL-INSURANCE-WITHDRAW-POLICY-1) per D5 decision: deposit-only mode
+    /// caps the bps cap from tag 22 rather than replacing it.
+    pub const INSURANCE_WITHDRAW_DEPOSITS_ONLY_FLAG: u16 = 0x8000;
+    pub const INSURANCE_WITHDRAW_MAX_BPS_MASK: u16 = 0x7FFF;
     pub const MATCHER_ABI_VERSION: u32 = 2;
     pub const MATCHER_CONTEXT_LEN: usize = 320;
     pub const MATCHER_CALL_TAG: u8 = 0;
@@ -2912,9 +2921,17 @@ pub mod state {
         /// Tuned by admin via UpdateConfig; typical production values are
         /// 10–100 (mature perp DEXs run ~20× insurance coverage).
         pub tvl_insurance_cap_mult: u16,
-        /// Padding for alignment (was [u8; 6]; shrunk when
-        /// tvl_insurance_cap_mult claimed 2 bytes of the former slot).
-        pub _iw_padding: [u8; 4],
+        /// Wave 12-F (port of upstream c175ec4): optional bounded-withdrawal
+        /// mode. 0 = legacy bounded withdrawals may withdraw live insurance
+        /// subject to bps/cooldown (existing tag 22 + tag 23 behavior).
+        /// 1 = tag 23 may withdraw only the remaining amount deposited
+        /// through TopUpInsurance; fee/trading/liquidation growth stays
+        /// behind. Set at InitMarket via the high bit of the wire-format
+        /// `insurance_withdraw_max_bps` (mask 0x8000).
+        pub insurance_withdraw_deposits_only: u8,
+        /// Padding for alignment (was [u8; 4]; shrunk when deposit-only
+        /// mode claimed 1 byte of the former slot).
+        pub _iw_padding: [u8; 3],
         /// Minimum slots between insurance withdrawals.
         pub insurance_withdraw_cooldown_slots: u64,
         /// Fork-retained: max oracle-price change per update in 0.01 bps (e2bps).
@@ -2931,11 +2948,15 @@ pub mod state {
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
         pub last_insurance_withdraw_slot: u64,
-        /// Padding slot previously occupied by `first_observed_stale_slot`
-        /// (legacy two-phase resolve telemetry). Removed; kept as u64
-        /// padding for u128-alignment of the downstream `maintenance_fee_
-        /// per_slot` and `last_mark_push_slot` fields.
-        pub _pad_obsolete_stale_slot: u64,
+        /// Wave 12-F (port of upstream c175ec4): remaining TopUpInsurance
+        /// principal withdrawable through tag 23 when
+        /// `insurance_withdraw_deposits_only == 1`. This tracks only
+        /// explicit top-ups: it increases on TopUpInsurance (tag 9) and
+        /// decreases on WithdrawInsuranceLimited (tag 23). Insurance growth
+        /// from fees/liquidations never increments this budget. Replaces
+        /// the prior `_pad_obsolete_stale_slot` padding (same offset, same
+        /// type, preserves MarketConfig layout).
+        pub insurance_withdraw_deposit_remaining: u64,
 
         // ========================================
         // Mark EWMA (trade-derived mark price for funding)
@@ -8081,7 +8102,16 @@ pub mod processor {
         if risk_params.initial_margin_bps < risk_params.maintenance_margin_bps {
             return Err(ProgramError::InvalidInstructionData);
         }
-        // insurance_withdraw_max_bps is a percentage (0..=10_000)
+        // Wave 12-F (port of upstream c175ec4): decode the deposits-only
+        // flag from the high bit of the wire-format `insurance_withdraw_max_bps`
+        // (mask 0x8000). The low 15 bits store the bps value.
+        let insurance_withdraw_deposits_only = (insurance_withdraw_max_bps
+            & crate::constants::INSURANCE_WITHDRAW_DEPOSITS_ONLY_FLAG)
+            != 0;
+        let insurance_withdraw_max_bps =
+            insurance_withdraw_max_bps & crate::constants::INSURANCE_WITHDRAW_MAX_BPS_MASK;
+        // insurance_withdraw_max_bps (low 15 bits) is a percentage (0..=10_000).
+        // The top wire bit is reserved for deposit-only mode.
         if insurance_withdraw_max_bps > 10_000 {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -8375,14 +8405,20 @@ pub mod processor {
             // ML8: tvl_insurance_cap_mult claimed 2 bytes of the former 6-byte
             // padding. Default 0 = check disabled.
             tvl_insurance_cap_mult: 0,
-            _iw_padding: [0u8; 4],
+            // Wave 12-F: deposit-only mode flag decoded from high bit of
+            // wire-format insurance_withdraw_max_bps.
+            insurance_withdraw_deposits_only: insurance_withdraw_deposits_only as u8,
+            _iw_padding: [0u8; 3],
             insurance_withdraw_cooldown_slots,
             last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
             // Hyperp: stamp init slot so stale check works from genesis.
             // Non-Hyperp: 0 (no mark push concept).
             last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
             last_insurance_withdraw_slot: 0,
-            _pad_obsolete_stale_slot: 0,
+            // Wave 12-F: top-up budget starts at 0 (no deposits yet).
+            // Incremented by TopUpInsurance handler (tag 9); decremented by
+            // WithdrawInsuranceLimited (tag 23) when deposits-only mode is on.
+            insurance_withdraw_deposit_remaining: 0,
             // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
             mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
             mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
@@ -10342,6 +10378,20 @@ pub mod processor {
         engine
             .top_up_insurance_fund(units as u128, clock.slot)
             .map_err(map_risk_error)?;
+        drop(engine);
+
+        // Wave 12-F (port of upstream c175ec4): increment the topup-budget
+        // counter that gates tag 23 WithdrawInsuranceLimited in
+        // deposits-only mode. The counter tracks ONLY explicit top-ups;
+        // insurance growth from fees/liquidations never increments it.
+        // Saturating add: an overflow here would be ~u64::MAX units of
+        // top-ups, which is operationally implausible (~1.8e19 base tokens).
+        let mut config_w = state::read_config(&data);
+        config_w.insurance_withdraw_deposit_remaining = config_w
+            .insurance_withdraw_deposit_remaining
+            .saturating_add(units);
+        state::write_config(&mut data, &config_w);
+
         Ok(())
     }
 
@@ -11551,6 +11601,21 @@ pub mod processor {
                 return Err(ProgramError::InvalidInstructionData);
             }
 
+            // Wave 12-F (port of upstream c175ec4): deposits-only mode
+            // additionally caps the withdrawal at the remaining TopUp
+            // principal. Layered ON TOP of fork tag 22's policy bounds —
+            // if both are active, the withdrawal must satisfy BOTH the
+            // bps/min cap above AND the deposit-budget cap here. This
+            // preserves KL-INSURANCE-WITHDRAW-POLICY-1 (fork tag 22 stays
+            // live) while adding upstream's stronger safety mode.
+            if config.insurance_withdraw_deposits_only != 0 {
+                let deposit_units_remaining =
+                    config.insurance_withdraw_deposit_remaining as u128;
+                if units_requested > deposit_units_remaining {
+                    return Err(PercolatorError::EngineInsufficientBalance.into());
+                }
+            }
+
             // effective_cooldown already computed and enforced above
 
             let req = percolator::U128::new(units_requested);
@@ -11559,6 +11624,16 @@ pub mod processor {
             }
             engine.insurance_fund.balance = engine.insurance_fund.balance - req;
             engine.vault = engine.vault - req;
+        }
+
+        // Wave 12-F: in deposits-only mode, decrement the topup-budget
+        // counter by the amount withdrawn (in units). Outside that mode the
+        // counter is unused and stays at whatever value TopUps wrote.
+        if config.insurance_withdraw_deposits_only != 0 {
+            let (units_withdrawn, _) = crate::units::base_to_units(amount, config.unit_scale);
+            config.insurance_withdraw_deposit_remaining = config
+                .insurance_withdraw_deposit_remaining
+                .saturating_sub(units_withdrawn);
         }
 
         // Persist cooldown slot.
