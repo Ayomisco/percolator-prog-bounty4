@@ -522,7 +522,7 @@ pub mod risk_buffer {
                 self.recompute_min();
                 return true;
             }
-            if notional <= self.min_notional {
+            if notional < self.min_notional {
                 return false;
             }
             let victim = self.min_slot();
