@@ -110,6 +110,11 @@ pub mod constants {
     /// Deterministic (vs TopUpBackingBucket's client-managed ledger) so deposit /
     /// redeem / crank all address the same `BackingDomainLedgerAccountV16`.
     pub const LP_BACKING_LEDGER_SEED: &[u8] = b"lp_backing_ledger";
+    /// LP Vault's shared redemption-escrow SPL token account PDA:
+    /// ["lp_escrow", market]. Owned by the registry PDA, holds the LP-mint
+    /// shares of all pending (requested-but-not-executed) redemptions. Invariant
+    /// I12: escrow balance == Σ(outstanding LpRedemption.shares).
+    pub const LP_ESCROW_SEED: &[u8] = b"lp_escrow";
 
     pub const LP_VAULT_VERSION: u8 = 1;
 
@@ -784,6 +789,30 @@ pub mod state {
             ],
             program_id,
         )
+    }
+
+    /// LP Vault shared redemption-escrow token account PDA: `["lp_escrow", market]`.
+    pub fn derive_lp_escrow(program_id: &Pubkey, market_group: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[crate::constants::LP_ESCROW_SEED, market_group.as_ref()],
+            program_id,
+        )
+    }
+
+    /// Consume an LpRedemption PDA by zeroing its header magic — the
+    /// DOUBLE-EXECUTE REPLAY GUARD. Keyed on PDA DATA, not lamports: an
+    /// attacker can re-fund lamports to a closed account within the same tx
+    /// (GC runs end-of-tx), but ONLY the program can rewrite the magic. After
+    /// this, `read_lp_redemption` (→ `check_header`) returns `NotInitialized`,
+    /// so any replayed `ExecuteRedemption` — even a second instruction in the
+    /// SAME transaction — rejects before any payout.
+    pub fn consume_lp_redemption(data: &mut [u8]) -> Result<(), ProgramError> {
+        if data.len() < HEADER_LEN {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        // Zero the 8-byte MAGIC; check_header then fails NotInitialized.
+        data[0..8].fill(0);
+        Ok(())
     }
 
     #[inline]
@@ -2341,6 +2370,10 @@ pub mod ix {
         DepositToLpVault {
             amount: u128,
         },
+        RequestRedeemLpShares {
+            lp_amount: u128,
+        },
+        ExecuteRedemption,
     }
 
     impl Instruction {
@@ -2574,6 +2607,10 @@ pub mod ix {
                 66 => Self::DepositToLpVault {
                     amount: read_u128(&mut rest)?,
                 },
+                67 => Self::RequestRedeemLpShares {
+                    lp_amount: read_u128(&mut rest)?,
+                },
+                68 => Self::ExecuteRedemption,
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -2966,6 +3003,13 @@ pub mod ix {
                 Self::DepositToLpVault { amount } => {
                     out.push(66);
                     push_u128(&mut out, amount);
+                }
+                Self::RequestRedeemLpShares { lp_amount } => {
+                    out.push(67);
+                    push_u128(&mut out, lp_amount);
+                }
+                Self::ExecuteRedemption => {
+                    out.push(68);
                 }
             }
             out
@@ -4964,6 +5008,10 @@ pub mod processor {
             Instruction::DepositToLpVault { amount } => {
                 handle_deposit_to_lp_vault(program_id, accounts, amount)
             }
+            Instruction::RequestRedeemLpShares { lp_amount } => {
+                handle_request_redeem_lp_shares(program_id, accounts, lp_amount)
+            }
+            Instruction::ExecuteRedemption => handle_execute_redemption(program_id, accounts),
         }
     }
 
@@ -5366,6 +5414,480 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
         }
+        Ok(())
+    }
+
+    /// LP Vault — RequestRedeemLpShares (tag 67). Phase 2.B Tier 3 Workstream 4B / Phase E.
+    ///
+    /// Step 1 of the two-step redemption (B-7 cooldown). Escrows the redeemer's
+    /// LP shares and records a redemption request; does NOT burn or pay out.
+    /// Per sign-off: shares are TRANSFERRED to a registry-owned escrow ATA (not
+    /// burned) so `total_lp_shares_outstanding == lp_mint.supply` (invariant I2)
+    /// holds through the cooldown, and the redeemer cannot sell/move the shares
+    /// while the request is pending. `total_lp_shares_outstanding` is UNCHANGED
+    /// here — the shares still exist, just escrowed.
+    ///
+    /// Conservation: TokenValueFlowProofV16 is the SPL transfer
+    /// (redeemer→escrow, balanced by SPL). No backing/source/lien/reservation
+    /// state changes (those happen at ExecuteRedemption). No Kani (account-init
+    /// + SPL transfer only).
+    #[inline(never)]
+    fn handle_request_redeem_lp_shares<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        lp_amount: u128,
+    ) -> ProgramResult {
+        let redeemer = account(accounts, 0)?;
+        let registry_ai = account(accounts, 1)?;
+        let lp_mint = account(accounts, 2)?;
+        let redeemer_lp_ata = account(accounts, 3)?;
+        let escrow_ai = account(accounts, 4)?;
+        let redemption_ai = account(accounts, 5)?;
+        let token_program = account(accounts, 6)?;
+        let system_program_ai = account(accounts, 7)?;
+
+        expect_signer(redeemer)?;
+        expect_writable(redeemer)?;
+        expect_writable(redeemer_lp_ata)?;
+        expect_writable(escrow_ai)?;
+        expect_writable(redemption_ai)?;
+        expect_owner(registry_ai, program_id)?;
+        verify_token_program(token_program)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if lp_amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        if registry.paused != 0 {
+            return Err(PercolatorError::LpVaultPaused.into());
+        }
+        let market_key = Pubkey::new_from_array(registry.market_group);
+        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, &market_key);
+        expect_key(registry_ai, &registry_pda)?;
+        if lp_mint.key.to_bytes() != registry.lp_mint {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        verify_user_token_account(redeemer_lp_ata, redeemer.key, lp_mint.key)?;
+        let lp_amount_u64 =
+            u64::try_from(lp_amount).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        require_token_balance(redeemer_lp_ata, lp_amount_u64)?;
+
+        // Escrow ATA (registry-owned, shared per vault): lazily created.
+        let (escrow_pda, escrow_bump) = state::derive_lp_escrow(program_id, &market_key);
+        expect_key(escrow_ai, &escrow_pda)?;
+        if escrow_ai.data_is_empty() {
+            let rent = Rent::get()?;
+            let len = spl_token::state::Account::LEN;
+            invoke_signed(
+                &system_instruction::create_account(
+                    redeemer.key,
+                    escrow_ai.key,
+                    rent.minimum_balance(len),
+                    len as u64,
+                    token_program.key,
+                ),
+                &[redeemer.clone(), escrow_ai.clone(), system_program_ai.clone()],
+                &[&[
+                    crate::constants::LP_ESCROW_SEED,
+                    market_key.as_ref(),
+                    &[escrow_bump],
+                ]],
+            )?;
+            let init_ix = spl_token::instruction::initialize_account3(
+                token_program.key,
+                escrow_ai.key,
+                lp_mint.key,
+                &registry_pda,
+            )?;
+            invoke(&init_ix, &[escrow_ai.clone(), lp_mint.clone(), token_program.clone()])?;
+        }
+
+        // Redemption PDA: one pending request per (registry, redeemer). Fails
+        // closed if a request already exists (must execute/cancel first).
+        let (redemption_pda, redemption_bump) =
+            state::derive_lp_redemption(program_id, &registry_pda, redeemer.key);
+        expect_key(redemption_ai, &redemption_pda)?;
+        if !redemption_ai.data_is_empty() {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        {
+            let rent = Rent::get()?;
+            let rlen = state::lp_redemption_account_len();
+            invoke_signed(
+                &system_instruction::create_account(
+                    redeemer.key,
+                    redemption_ai.key,
+                    rent.minimum_balance(rlen),
+                    rlen as u64,
+                    program_id,
+                ),
+                &[redeemer.clone(), redemption_ai.clone(), system_program_ai.clone()],
+                &[&[
+                    crate::constants::LP_REDEMPTION_SEED,
+                    registry_pda.as_ref(),
+                    redeemer.key.as_ref(),
+                    &[redemption_bump],
+                ]],
+            )?;
+        }
+
+        // Escrow the shares (redeemer signs — owns the source).
+        transfer_tokens(token_program, redeemer_lp_ata, escrow_ai, redeemer, lp_amount_u64)?;
+
+        // Record the request. total_lp_shares_outstanding UNCHANGED (I2 holds).
+        let now_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
+        let redemption = state::LpRedemptionV16 {
+            registry: registry_pda.to_bytes(),
+            redeemer: redeemer.key.to_bytes(),
+            shares: lp_amount,
+            request_slot: now_slot,
+            version: crate::constants::LP_VAULT_VERSION,
+            bump: redemption_bump,
+            _padding: [0u8; 6],
+        };
+        state::init_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?, &redemption)?;
+        Ok(())
+    }
+
+    /// LP Vault — ExecuteRedemption (tag 68). Phase 2.B Tier 3 Workstream 4B / Phase E.
+    ///
+    /// Step 2: after cooldown, pays the redeemer their execute-time pro-rata
+    /// share of the vault and burns the escrowed shares. Permissionless.
+    ///
+    /// DOUBLE-EXECUTE REPLAY GUARD (headline): the FIRST thing this does is
+    /// `read_lp_redemption`, which fails `NotInitialized` if the PDA's magic was
+    /// zeroed by a prior consume. The LAST thing it does is
+    /// `consume_lp_redemption` (zero the magic) — keyed on DATA, not lamports,
+    /// so even a SECOND ExecuteRedemption in the SAME transaction (where lamports
+    /// could be re-funded before end-of-tx GC) rejects on the zeroed magic.
+    ///
+    /// Sequence (lp_vault_design.md §5.6): read PDA (replay guard) → cooldown
+    /// (I5) → NAV from ledger counters (Note 2) → round-DOWN
+    /// `lp_atoms_for_redemption` → OI guard (I6) → inline withdraw mirroring
+    /// `handle_withdraw_backing_bucket` (bucket/source/ledger decrements +
+    /// `vault_authority`-signed transfer to the redeemer directly) → burn shares
+    /// from escrow (registry PDA signs) → `total_lp_shares_outstanding -= shares`
+    /// → consume PDA.
+    ///
+    /// AUDIT MIRROR: the backing decrement sequence is mirrored from
+    /// `handle_withdraw_backing_bucket` — change BOTH together. The differential
+    /// test `lp_execute_redemption_backing_state_matches_withdraw` fails if they
+    /// drift.
+    ///
+    /// Conservation (mirror of deposit, shrinking the reservation):
+    /// TokenValueFlowProofV16 (vault→redeemer), StockReconciliationProofV16 (LP
+    /// supply-- via escrow burn vs vault principal--), ReservationEncumbranceProofV16
+    /// + SourceCreditLienAggregateProofV16 (backing reservation shrinks) —
+    /// produced by the inlined decrement + validate_shape.
+    #[inline(never)]
+    fn handle_execute_redemption<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let cranker = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let redemption_ai = account(accounts, 3)?;
+        let lp_mint = account(accounts, 4)?;
+        let escrow_ai = account(accounts, 5)?;
+        let vault_token = account(accounts, 6)?;
+        let vault_authority_ai = account(accounts, 7)?;
+        let ledger_ai = account(accounts, 8)?;
+        let redeemer_dest = account(accounts, 9)?;
+        let token_program = account(accounts, 10)?;
+
+        expect_signer(cranker)?;
+        expect_writable(market_ai)?;
+        expect_writable(registry_ai)?;
+        expect_writable(redemption_ai)?;
+        expect_writable(lp_mint)?;
+        expect_writable(escrow_ai)?;
+        expect_writable(vault_token)?;
+        expect_writable(ledger_ai)?;
+        expect_writable(redeemer_dest)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(redemption_ai, program_id)?;
+        expect_owner(ledger_ai, program_id)?;
+        verify_token_program(token_program)?;
+
+        // ── REPLAY GUARD: rejects NotInitialized if the magic was zeroed. ──
+        let redemption = state::read_lp_redemption(&redemption_ai.try_borrow_data()?)?;
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+
+        // Bindings.
+        let market_key = Pubkey::new_from_array(registry.market_group);
+        expect_key(market_ai, &market_key)?;
+        let (registry_pda, registry_bump) = state::derive_lp_vault_registry(program_id, &market_key);
+        expect_key(registry_ai, &registry_pda)?;
+        if redemption.registry != registry_pda.to_bytes() {
+            return Err(PercolatorError::LpVaultNotFound.into());
+        }
+        let redeemer = Pubkey::new_from_array(redemption.redeemer);
+        let (redemption_pda, _) = state::derive_lp_redemption(program_id, &registry_pda, &redeemer);
+        expect_key(redemption_ai, &redemption_pda)?;
+        if lp_mint.key.to_bytes() != registry.lp_mint {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        let (escrow_pda, _) = state::derive_lp_escrow(program_id, &market_key);
+        expect_key(escrow_ai, &escrow_pda)?;
+
+        // ── Cooldown gate (I5). ──
+        let now_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
+        if !percolator::lp_vault::lp_redemption_cooldown_elapsed(
+            redemption.request_slot,
+            now_slot,
+            registry.redemption_cooldown_slots,
+        ) {
+            return Err(PercolatorError::LpVaultCooldownActive.into());
+        }
+
+        let domain = registry.domain as usize;
+        let asset_index = domain / 2;
+
+        // Collateral mint + vault authority + redeemer dest checks.
+        let (cfg, mode, configured_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        if domain >= configured_slots.saturating_mul(2) || asset_index >= configured_slots {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mint = primary_collateral_mint(&cfg);
+        let (vault_authority, vault_bump) = derive_vault_authority(program_id, market_ai.key);
+        expect_key(vault_authority_ai, &vault_authority)?;
+        verify_user_token_account(redeemer_dest, &redeemer, &mint)?;
+        verify_vault_token_account(vault_token, &vault_authority, &mint)?;
+
+        // ── NAV (pre-withdraw) → atoms (round DOWN, Note 2). ──
+        let atoms = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+            let ledger_data = ledger_ai.try_borrow_data()?;
+            let (mut ledger, _) = read_or_new_backing_domain_ledger(
+                &ledger_data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                &bucket,
+            )?;
+            sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            let nav = percolator::lp_vault::lp_vault_nav_atoms(
+                ledger.total_principal_atoms,
+                ledger.total_earnings_atoms,
+                ledger.total_earnings_withdrawn_atoms,
+                ledger.cumulative_loss_atoms,
+                ledger.cumulative_recovery_atoms,
+                registry.fee_share_bps,
+            )
+            .map_err(map_v16_error)?;
+            percolator::lp_vault::lp_atoms_for_redemption(
+                redemption.shares,
+                registry.total_lp_shares_outstanding,
+                nav,
+            )
+            .map_err(map_v16_error)?
+        };
+        // Dust-share redemption rounding to 0 atoms would burn shares for no
+        // payout — reject (recoverable via cancel in Phase H).
+        if atoms == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+        let atoms_u64 = amount_to_u64(atoms)?;
+        let backing_num = atoms
+            .checked_mul(BOUND_SCALE)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+
+        // ── Inline withdraw — MIRRORS handle_withdraw_backing_bucket. ──
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg_v, group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            // Registry must be the backing authority for this domain (Note 5).
+            let authorities = domain_authorities_from_view(&group, &cfg_v, domain)?;
+            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+                return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+            }
+            if asset_index >= group.markets.len()
+                || asset_index >= group.header.config.max_market_slots.get() as usize
+            {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            let (source_acc, bucket_acc) = if domain % 2 == 0 {
+                (
+                    &mut group.markets[asset_index].engine.source_credit_long,
+                    &mut group.markets[asset_index].engine.backing_long,
+                )
+            } else {
+                (
+                    &mut group.markets[asset_index].engine.source_credit_short,
+                    &mut group.markets[asset_index].engine.backing_short,
+                )
+            };
+            let mut source = source_acc.try_to_runtime().map_err(map_v16_error)?;
+            let mut bucket = bucket_acc.try_to_runtime().map_err(map_v16_error)?;
+            let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
+            let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+                &ledger_data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                &bucket,
+            )?;
+            sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            if atoms > ledger.total_principal_atoms {
+                return Err(PercolatorError::EngineCounterUnderflow.into());
+            }
+            // Same withdrawability gate as handle_withdraw_backing_bucket.
+            if source.positive_claim_bound_num != 0
+                || source.exact_positive_claim_num != 0
+                || bucket.status != BackingBucketStatusV16::Fresh
+                || bucket.fresh_unliened_backing_num < backing_num
+                || source.fresh_reserved_backing_num < backing_num
+                || atoms > group.header.vault.get()
+            {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            // OI reservation guard (I6): leave nav_post * threshold/10_000 of
+            // outstanding backing covered. nav_post == ledger principal after
+            // this withdraw (no earnings change here).
+            if registry.oi_reservation_threshold_bps != 0 {
+                let outstanding_post = bucket
+                    .fresh_unliened_backing_num
+                    .checked_sub(backing_num)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?
+                    .checked_add(bucket.valid_liened_backing_num)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                let nav_post = ledger
+                    .total_principal_atoms
+                    .checked_sub(atoms)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?
+                    .checked_mul(BOUND_SCALE)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                let covered = nav_post
+                    .checked_mul(registry.oi_reservation_threshold_bps as u128)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                    / 10_000u128;
+                if covered < outstanding_post {
+                    return Err(PercolatorError::LpVaultOiReservationViolated.into());
+                }
+            }
+            bucket.fresh_unliened_backing_num = bucket
+                .fresh_unliened_backing_num
+                .checked_sub(backing_num)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            if bucket.fresh_unliened_backing_num == 0 && bucket.valid_liened_backing_num == 0 {
+                if bucket.impaired_liened_backing_num != 0 {
+                    bucket.status = BackingBucketStatusV16::Impaired;
+                } else if bucket.consumed_liened_backing_num != 0 {
+                    bucket.status = BackingBucketStatusV16::Expired;
+                } else {
+                    bucket.status = BackingBucketStatusV16::Empty;
+                    bucket.expiry_slot = 0;
+                }
+            }
+            source.fresh_reserved_backing_num = source
+                .fresh_reserved_backing_num
+                .checked_sub(backing_num)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            source.credit_rate_num = percolator::CREDIT_RATE_SCALE;
+            source.credit_epoch = source
+                .credit_epoch
+                .checked_add(1)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            *source_acc = percolator::SourceCreditStateV16Account::from_runtime(&source);
+            *bucket_acc = percolator::BackingBucketV16Account::from_runtime(&bucket);
+            group.header.risk_epoch = percolator::V16PodU64::new(
+                group
+                    .header
+                    .risk_epoch
+                    .get()
+                    .checked_add(1)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            );
+            group.header.vault = percolator::V16PodU128::new(
+                group
+                    .header
+                    .vault
+                    .get()
+                    .checked_sub(atoms)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?,
+            );
+            ledger.total_principal_atoms = ledger
+                .total_principal_atoms
+                .checked_sub(atoms)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            ledger.total_principal_withdrawn_atoms = ledger
+                .total_principal_withdrawn_atoms
+                .checked_add(atoms)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            group.validate_shape().map_err(map_v16_error)?;
+            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+        }
+
+        // ── Transfer vault → redeemer (vault_authority PDA signs). ──
+        let vault_bump_arr = [vault_bump];
+        let vault_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &vault_bump_arr]];
+        transfer_tokens_signed(
+            token_program,
+            vault_token,
+            redeemer_dest,
+            vault_authority_ai,
+            atoms_u64,
+            vault_seeds,
+        )?;
+
+        // ── Burn the escrowed shares (registry PDA signs as escrow owner). ──
+        let shares_u64 =
+            u64::try_from(redemption.shares).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        let burn_ix = spl_token::instruction::burn(
+            token_program.key,
+            escrow_ai.key,
+            lp_mint.key,
+            &registry_pda,
+            &[],
+            shares_u64,
+        )?;
+        invoke_signed(
+            &burn_ix,
+            &[
+                escrow_ai.clone(),
+                lp_mint.clone(),
+                registry_ai.clone(),
+                token_program.clone(),
+            ],
+            &[&[
+                crate::constants::LP_VAULT_REGISTRY_SEED,
+                market_ai.key.as_ref(),
+                &[registry_bump],
+            ]],
+        )?;
+
+        // ── Decrement outstanding shares (mirrors the burn). ──
+        {
+            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+            reg.total_lp_shares_outstanding = reg
+                .total_lp_shares_outstanding
+                .checked_sub(redemption.shares)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+        }
+
+        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent. ──
+        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
+        let reclaim = redemption_ai.lamports();
+        **redemption_ai.try_borrow_mut_lamports()? = 0;
+        **cranker.try_borrow_mut_lamports()? = cranker
+            .lamports()
+            .checked_add(reclaim)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         Ok(())
     }
 
@@ -6974,6 +7496,15 @@ pub mod processor {
     }
 
     #[inline(never)]
+    // AUDIT MIRROR: the backing-bucket + source + BackingDomainLedger decrement
+    // sequence in this handler (bucket.fresh_unliened -= / status transition,
+    // source.fresh_reserved -= / credit_epoch++, risk_epoch++, vault -=,
+    // ledger.total_principal -= / total_principal_withdrawn +=, validate_shape,
+    // vault_authority-signed transfer to dest) is mirrored inside
+    // `handle_execute_redemption` (LP Vault Phase E, Option A). Change BOTH
+    // together. The differential test
+    // `lp_execute_redemption_backing_state_matches_withdraw` fails mechanically
+    // if the two sequences ever drift.
     fn handle_withdraw_backing_bucket<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
