@@ -2374,6 +2374,11 @@ pub mod ix {
             lp_amount: u128,
         },
         ExecuteRedemption,
+        LpVaultCrankFees,
+        SetLpVaultPaused {
+            paused: u8,
+        },
+        CloseLpVault,
     }
 
     impl Instruction {
@@ -2611,6 +2616,11 @@ pub mod ix {
                     lp_amount: read_u128(&mut rest)?,
                 },
                 68 => Self::ExecuteRedemption,
+                69 => Self::LpVaultCrankFees,
+                70 => Self::SetLpVaultPaused {
+                    paused: read_u8(&mut rest)?,
+                },
+                71 => Self::CloseLpVault,
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -3010,6 +3020,16 @@ pub mod ix {
                 }
                 Self::ExecuteRedemption => {
                     out.push(68);
+                }
+                Self::LpVaultCrankFees => {
+                    out.push(69);
+                }
+                Self::SetLpVaultPaused { paused } => {
+                    out.push(70);
+                    out.push(paused);
+                }
+                Self::CloseLpVault => {
+                    out.push(71);
                 }
             }
             out
@@ -5012,6 +5032,11 @@ pub mod processor {
                 handle_request_redeem_lp_shares(program_id, accounts, lp_amount)
             }
             Instruction::ExecuteRedemption => handle_execute_redemption(program_id, accounts),
+            Instruction::LpVaultCrankFees => handle_lp_vault_crank_fees(program_id, accounts),
+            Instruction::SetLpVaultPaused { paused } => {
+                handle_set_lp_vault_paused(program_id, accounts, paused)
+            }
+            Instruction::CloseLpVault => handle_close_lp_vault(program_id, accounts),
         }
     }
 
@@ -5885,6 +5910,186 @@ pub mod processor {
         let reclaim = redemption_ai.lamports();
         **redemption_ai.try_borrow_mut_lamports()? = 0;
         **cranker.try_borrow_mut_lamports()? = cranker
+            .lamports()
+            .checked_add(reclaim)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok(())
+    }
+
+    /// LP Vault — LpVaultCrankFees (tag 69). Phase 2.B Tier 3 Workstream 4B / Phase F.
+    ///
+    /// Permissionless snapshot bookkeeping. Syncs the backing-domain ledger from
+    /// the live bucket (so NAV reflects accrued utilization-fee earnings), then
+    /// advances the insurance-fee snapshot and records the cumulative LP-side
+    /// distribution.
+    ///
+    /// CORRECTED MODEL (sign-off Note 4): the earnings signal is
+    /// `total_earnings_atoms` (synced from `bucket.utilization_fee_earnings`),
+    /// NOT `cumulative_recovery_atoms`. LP-side earnings accrue AUTOMATICALLY via
+    /// NAV (`total_earnings_atoms` is a `lp_vault_nav_atoms` input) — this crank
+    /// moves NO tokens; it only advances the snapshot + audit counter. The
+    /// insurance-side fraction is a v1 stub (Note 3): it accrues in the bucket as
+    /// a protocol reserve; no insurance token routing in v1.
+    ///
+    /// Conservation: structurally pure-meta (snapshot + audit-counter update +
+    /// ledger sync persist). No token/stock/lien/reservation value change beyond
+    /// the idempotent ledger sync. All 4 proofs N/A.
+    #[inline(never)]
+    fn handle_lp_vault_crank_fees<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let cranker = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let ledger_ai = account(accounts, 3)?;
+        expect_signer(cranker)?;
+        expect_writable(market_ai)?;
+        expect_writable(registry_ai)?;
+        expect_writable(ledger_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(ledger_ai, program_id)?;
+
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let market_key = Pubkey::new_from_array(registry.market_group);
+        expect_key(market_ai, &market_key)?;
+        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, &market_key);
+        expect_key(registry_ai, &registry_pda)?;
+        let (ledger_pda, _) =
+            state::derive_lp_backing_ledger(program_id, &market_key, registry.domain);
+        expect_key(ledger_ai, &ledger_pda)?;
+        let domain = registry.domain as usize;
+
+        // Sync the ledger from the live bucket, persist, read current earnings.
+        let total_earnings = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+            let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
+            let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+                &ledger_data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                &bucket,
+            )?;
+            sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            let te = ledger.total_earnings_atoms;
+            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+            te
+        };
+
+        let delta = total_earnings
+            .checked_sub(registry.insurance_fee_snapshot_atoms)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        if delta == 0 {
+            return Err(PercolatorError::LpVaultNoFeesToCrank.into());
+        }
+        let (lp_side, _insurance_side) =
+            percolator::lp_vault::lp_fee_split(delta, registry.fee_share_bps).map_err(map_v16_error)?;
+        {
+            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+            reg.insurance_fee_snapshot_atoms = total_earnings;
+            reg.fee_distribution_total_atoms = reg
+                .fee_distribution_total_atoms
+                .checked_add(lp_side)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+        }
+        Ok(())
+    }
+
+    /// LP Vault — SetLpVaultPaused (tag 70). Phase 2.B Tier 3 Workstream 4B / Phase G.
+    /// Admin toggles the vault pause flag. Paused vaults reject DepositToLpVault
+    /// and RequestRedeemLpShares (ExecuteRedemption + CloseLpVault still allowed).
+    /// Pure-meta; no conservation proofs.
+    #[inline(never)]
+    fn handle_set_lp_vault_paused<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        paused: u8,
+    ) -> ProgramResult {
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        expect_signer(admin)?;
+        expect_writable(registry_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        if paused > 1 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let market_key = Pubkey::new_from_array(registry.market_group);
+        expect_key(market_ai, &market_key)?;
+        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, &market_key);
+        expect_key(registry_ai, &registry_pda)?;
+        let (cfg, _, _, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if admin.key.to_bytes() != cfg.admin {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        registry.paused = paused;
+        state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
+        Ok(())
+    }
+
+    /// LP Vault — CloseLpVault (tag 71). Phase 2.B Tier 3 Workstream 4B / Phase G.
+    /// Admin-gated. Requires zero outstanding shares (registry counter AND the
+    /// live LP mint supply — defense against an I2 desync). Closes the registry
+    /// PDA (zero data + reclaim rent to admin). The LP mint is left on-chain at
+    /// supply 0 as a historical record (design §19).
+    /// Pure-meta; no conservation proofs.
+    #[inline(never)]
+    fn handle_close_lp_vault<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let lp_mint = account(accounts, 3)?;
+        expect_signer(admin)?;
+        expect_writable(admin)?;
+        expect_writable(registry_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        if registry.total_lp_shares_outstanding != 0 {
+            return Err(PercolatorError::LpVaultSharesOutstanding.into());
+        }
+        let market_key = Pubkey::new_from_array(registry.market_group);
+        expect_key(market_ai, &market_key)?;
+        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, &market_key);
+        expect_key(registry_ai, &registry_pda)?;
+        if lp_mint.key.to_bytes() != registry.lp_mint {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        let (cfg, _, _, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if admin.key.to_bytes() != cfg.admin {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        // Defense-in-depth (I2): the live SPL mint supply must also be zero.
+        {
+            let mint_data = lp_mint.try_borrow_data()?;
+            let mint = spl_token::state::Mint::unpack(&mint_data)?;
+            if mint.supply != 0 {
+                return Err(PercolatorError::LpVaultSharesOutstanding.into());
+            }
+        }
+        // Close the registry PDA: zero data + reclaim rent to admin.
+        {
+            let mut data = registry_ai.try_borrow_mut_data()?;
+            for b in data.iter_mut() {
+                *b = 0;
+            }
+        }
+        let reclaim = registry_ai.lamports();
+        **registry_ai.try_borrow_mut_lamports()? = 0;
+        **admin.try_borrow_mut_lamports()? = admin
             .lamports()
             .checked_add(reclaim)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
