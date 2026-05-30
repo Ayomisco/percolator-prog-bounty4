@@ -33,16 +33,27 @@ mod common;
 use common::*;
 
 use litesvm::LiteSVM;
-use percolator::{MarketGroupV16, PortfolioAccountV16};
-use percolator_prog::{ix::Instruction as ProgInstruction, processor::ASSET_ACTION_ACTIVATE, state};
+use percolator::{
+    MarketGroupV16, PortfolioAccountV16, PortfolioAccountV16Account, PortfolioLegV16Account,
+    ProvenanceHeaderV16Account, V16PodI128, V16PodU16, V16PodU32, V16PodU64, V16_ACCOUNT_VERSION,
+    V16_LAYOUT_DISCRIMINATOR, POS_SCALE,
+};
+use percolator_prog::{
+    constants::{
+        HEADER_LEN, KIND_PORTFOLIO, MAGIC, MATCHER_ABI_VERSION, NFT_REGISTRY_SEED, VERSION,
+    },
+    ix::Instruction as ProgInstruction,
+    processor::ASSET_ACTION_ACTIVATE,
+    state,
+};
 use solana_sdk::{
     account::Account,
     instruction::{AccountMeta, Instruction, InstructionError},
     program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    system_instruction, system_program,
-    transaction::TransactionError,
+    system_instruction, system_program, sysvar,
+    transaction::{Transaction, TransactionError},
 };
 use spl_token::state::{Account as TokenAccount, Mint};
 
@@ -306,9 +317,10 @@ fn x0_smoke_wrapper_vault_gate_requires_classic_token_program() {
 const CROSSCUT_MAX_ASSETS: u16 = 1;
 /// Tradable asset index (proven v16_cu pattern: activate+trade asset 1, domain 2).
 const CROSSCUT_ASSET: u16 = 1;
+/// LP-vault domain = long side of the tradable asset (`domain = 2 * asset_index`).
+const CROSSCUT_DOMAIN: u16 = 2;
 
-// Fields are consumed incrementally across the 3A.1→3A.5 lifecycle build
-// (matcher_program/vault_authority land with the trade + withdraw steps next).
+// Fields are consumed incrementally across the 3A.1→3A.5 lifecycle build.
 #[allow(dead_code)]
 struct CrosscutEnv {
     svm: LiteSVM,
@@ -322,6 +334,11 @@ struct CrosscutEnv {
     vault: Pubkey,
     vault_authority: Pubkey,
     portfolio_len: usize,
+    // LP-vault PDAs (all derived under MAINNET).
+    lp_registry: Pubkey,
+    lp_mint: Pubkey,
+    lp_escrow: Pubkey,
+    lp_ledger: Pubkey,
 }
 
 impl CrosscutEnv {
@@ -379,6 +396,11 @@ impl CrosscutEnv {
 
         let portfolio_len =
             state::portfolio_account_len_for_market_slots(CROSSCUT_MAX_ASSETS as usize).unwrap();
+        // LP-vault PDAs, derived under MAINNET (program_id).
+        let (lp_registry, _) = state::derive_lp_vault_registry(&program_id, &market);
+        let (lp_mint, _) = state::derive_lp_vault_mint(&program_id, &market);
+        let (lp_escrow, _) = state::derive_lp_escrow(&program_id, &market);
+        let (lp_ledger, _) = state::derive_lp_backing_ledger(&program_id, &market, CROSSCUT_DOMAIN);
         let mut env = CrosscutEnv {
             svm,
             program_id,
@@ -390,6 +412,10 @@ impl CrosscutEnv {
             vault,
             vault_authority,
             portfolio_len,
+            lp_registry,
+            lp_mint,
+            lp_escrow,
+            lp_ledger,
         };
 
         let admin = env.admin.insecure_clone();
@@ -433,6 +459,9 @@ impl CrosscutEnv {
 
     fn activate_asset(&mut self, asset_index: u16, now_slot: u64, initial_price: u64) {
         let admin = self.admin.insecure_clone();
+        // backing_bucket_authority = LP registry PDA so DepositToLpVault passes the
+        // authority-handover gate (two-step create; LpVaultAuthorityMismatch otherwise).
+        // Harmless to the trade/user-deposit paths, which never touch it.
         self.try_wrapper(
             ProgInstruction::UpdateAssetLifecycle {
                 action: ASSET_ACTION_ACTIVATE,
@@ -441,7 +470,7 @@ impl CrosscutEnv {
                 initial_price,
                 insurance_authority: admin.pubkey().to_bytes(),
                 insurance_operator: admin.pubkey().to_bytes(),
-                backing_bucket_authority: admin.pubkey().to_bytes(),
+                backing_bucket_authority: self.lp_registry.to_bytes(),
                 oracle_authority: admin.pubkey().to_bytes(),
             },
             vec![
@@ -563,4 +592,898 @@ fn x0_economic_spine_deposit_moves_tokens_at_mainnet() {
     // Ledger lockstep: group.vault ledger == on-chain vault balance.
     assert_eq!(env.group().vault, 1_000, "group.vault ledger == on-chain vault");
     assert_eq!(env.portfolio(portfolio).capital, 1_000, "portfolio capital credited");
+}
+
+// ── Matcher CPI helpers (mirrors v16_cu.rs:101-128,1121-1234, re-keyed MAINNET) ──
+
+const MATCHER_CONTEXT_LEN: usize = 320;
+
+fn matcher_delegate_key(
+    program_id: &Pubkey,
+    market: &Pubkey,
+    maker: &Pubkey,
+    matcher_program: &Pubkey,
+    matcher_context: &Pubkey,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"matcher",
+            market.as_ref(),
+            maker.as_ref(),
+            matcher_program.as_ref(),
+            matcher_context.as_ref(),
+        ],
+        program_id,
+    )
+    .0
+}
+
+fn encode_matcher_init_passive(max_fill_abs: u128) -> Vec<u8> {
+    let mut data = vec![0u8; 66];
+    data[0] = 2;
+    data[1] = 0;
+    data[10..14].copy_from_slice(&100u32.to_le_bytes());
+    data[34..50].copy_from_slice(&max_fill_abs.to_le_bytes());
+    data
+}
+
+fn active_leg_basis(p: &PortfolioAccountV16, asset_index: u16) -> i128 {
+    p.legs
+        .iter()
+        .find(|l| l.active && l.asset_index as usize == asset_index as usize)
+        .map(|l| l.basis_pos_q)
+        .expect("active leg for asset present after fill")
+}
+
+impl CrosscutEnv {
+    /// Create + initialize a passive matcher context bound to `maker_account`.
+    /// The delegate PDA derives under `self.program_id` (= MAINNET), matching the
+    /// wrapper's own derivation at trade time (v16_program.rs:7345/7352).
+    fn init_matcher_context(&mut self, maker_account: Pubkey) -> (Pubkey, Pubkey) {
+        let ctx = Pubkey::new_unique();
+        let delegate = matcher_delegate_key(
+            &self.program_id,
+            &self.market,
+            &maker_account,
+            &self.matcher_program,
+            &ctx,
+        );
+        self.svm
+            .set_account(
+                delegate,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![],
+                    owner: Pubkey::default(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        self.svm
+            .set_account(
+                ctx,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; MATCHER_CONTEXT_LEN],
+                    owner: self.matcher_program,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        send_ixs(
+            &mut self.svm,
+            &self.payer,
+            vec![Instruction {
+                program_id: self.matcher_program,
+                accounts: vec![
+                    AccountMeta::new_readonly(delegate, false),
+                    AccountMeta::new(ctx, false),
+                ],
+                data: encode_matcher_init_passive(u128::MAX),
+            }],
+            &[],
+        )
+        .expect("init matcher context");
+        (ctx, delegate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trade_cpi(
+        &mut self,
+        owner_a: &Keypair,
+        account_a: Pubkey,
+        owner_b: &Keypair,
+        account_b: Pubkey,
+        ctx: Pubkey,
+        delegate: Pubkey,
+        asset_index: u16,
+        size_q: i128,
+        fee_bps: u64,
+    ) -> Result<(), TransactionError> {
+        let wix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner_a.pubkey(), true),
+                AccountMeta::new(owner_b.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(account_a, false),
+                AccountMeta::new(account_b, false),
+                AccountMeta::new_readonly(self.matcher_program, false),
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(delegate, false),
+            ],
+            data: ProgInstruction::TradeCpi {
+                asset_index,
+                size_q,
+                fee_bps,
+                limit_price: 0,
+            }
+            .encode(),
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![wix], &[owner_a, owner_b])
+    }
+
+    fn account_data(&self, key: Pubkey) -> Vec<u8> {
+        self.svm.get_account(&key).unwrap().data
+    }
+}
+
+// ── LP-vault helpers (mirrors v16_fork_lp_vault_*.rs, re-keyed MAINNET) ──────
+
+impl CrosscutEnv {
+    /// CreateLpVault (tag 65) on `CROSSCUT_DOMAIN`. Creates the registry + LP mint
+    /// PDAs (the asset's backing authority was already set to `lp_registry` in
+    /// `new()`, completing the two-step handover).
+    fn lp_create(&mut self, fee_share_bps: u16, redemption_cooldown_slots: u64) {
+        let admin = self.admin.insecure_clone();
+        self.try_wrapper(
+            ProgInstruction::CreateLpVault {
+                fee_share_bps,
+                redemption_cooldown_slots,
+                oi_reservation_threshold_bps: 0,
+                domain: CROSSCUT_DOMAIN,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(self.market, false),
+                AccountMeta::new(self.lp_registry, false),
+                AccountMeta::new(self.lp_mint, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+            ],
+            &[&admin],
+        )
+        .expect("create lp vault");
+    }
+
+    /// DepositToLpVault (tag 66). Returns `(lp_share_ata, collateral_source)`.
+    fn lp_deposit(&mut self, depositor: &Keypair, amount: u128) -> (Pubkey, Pubkey) {
+        let lp_ata = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                lp_ata,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.lp_mint, depositor.pubkey(), 0),
+                    owner: spl_token_classic_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let source = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                source,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, depositor.pubkey(), amount as u64),
+                    owner: spl_token_classic_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let wix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(self.lp_registry, false),
+                AccountMeta::new(self.lp_mint, false),
+                AccountMeta::new(lp_ata, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new(self.lp_ledger, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: ProgInstruction::DepositToLpVault { amount }.encode(),
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![wix], &[depositor]).expect("lp deposit");
+        (lp_ata, source)
+    }
+
+    /// RequestRedeemLpShares (tag 67). `redemption` = `derive_lp_redemption(...)`.
+    fn lp_request_redeem(&mut self, depositor: &Keypair, redemption: Pubkey, lp_ata: Pubkey, lp_amount: u128) {
+        let wix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(self.lp_registry, false),
+                AccountMeta::new(self.lp_mint, false),
+                AccountMeta::new(lp_ata, false),
+                AccountMeta::new(self.lp_escrow, false),
+                AccountMeta::new(redemption, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: ProgInstruction::RequestRedeemLpShares { lp_amount }.encode(),
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![wix], &[depositor]).expect("lp request redeem");
+    }
+
+    /// ExecuteRedemption (tag 68) — permissionless crank. Returns the payout dest.
+    fn lp_execute_redeem(&mut self, depositor: &Keypair, redemption: Pubkey) -> Pubkey {
+        let dest = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                dest,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, depositor.pubkey(), 0),
+                    owner: spl_token_classic_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let wix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(self.lp_registry, false),
+                AccountMeta::new(redemption, false),
+                AccountMeta::new(self.lp_mint, false),
+                AccountMeta::new(self.lp_escrow, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new(self.lp_ledger, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+            ],
+            data: ProgInstruction::ExecuteRedemption.encode(),
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![wix], &[]).expect("lp execute redemption");
+        dest
+    }
+}
+
+/// 3A.1c — full LP-vault lifecycle (create → deposit → request → execute) at
+/// MAINNET, sharing the market vault with the user-collateral path.
+#[test]
+fn x0_lp_vault_lifecycle_at_mainnet() {
+    let mut env = CrosscutEnv::new();
+    env.lp_create(0, 0); // no fee, zero cooldown (immediate redeem)
+
+    let depositor = Keypair::new();
+    env.svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let (lp_ata, source) = env.lp_deposit(&depositor, 1_000_000);
+
+    // Executed guard: first deposit mints 1:1, collateral into the vault.
+    assert_eq!(env.token_amount(lp_ata), 1_000_000, "first deposit mints amount shares");
+    assert_eq!(env.token_amount(env.vault), 1_000_000, "vault received LP collateral");
+    assert_eq!(env.token_amount(source), 0, "source debited");
+    let reg = state::read_lp_vault_registry(&env.account_data(env.lp_registry)).unwrap();
+    assert_eq!(reg.total_lp_shares_outstanding, 1_000_000, "registry shares == minted");
+
+    // Redeem the full position.
+    let redemption = state::derive_lp_redemption(&env.program_id, &env.lp_registry, &depositor.pubkey()).0;
+    env.lp_request_redeem(&depositor, redemption, lp_ata, 1_000_000);
+    assert_eq!(env.token_amount(lp_ata), 0, "shares moved to escrow");
+    assert_eq!(env.token_amount(env.lp_escrow), 1_000_000, "escrow holds the shares");
+
+    let dest = env.lp_execute_redeem(&depositor, redemption);
+    assert_eq!(env.token_amount(dest), 1_000_000, "redeemer paid 1:1");
+    assert_eq!(env.token_amount(env.lp_escrow), 0, "escrow burned to zero");
+    assert_eq!(env.token_amount(env.vault), 0, "vault drained");
+    let reg = state::read_lp_vault_registry(&env.account_data(env.lp_registry)).unwrap();
+    assert_eq!(reg.total_lp_shares_outstanding, 0, "registry outstanding back to 0");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NFT B-3 ownership transfer (mirrors v16_nft_e2e.rs, in the 5-program instance).
+// The Token-2022 mint is real (CPI-initialized with the transfer-hook extension);
+// the PositionNft / ExtraAccountMetaList PDAs are crafted (the e2e harness has no
+// on-chain MintPositionNft). The TransferChecked → hook → B-3 CPI is REAL: its
+// success proves the registry's nft_program_id is byte-correct (else Custom(45)).
+// The deep NFT-under-live-trade scenarios are X1/X5/X7 (3A.4).
+// ════════════════════════════════════════════════════════════════════════════
+
+const EXTRA_METAS_SEED: &[u8] = b"extra-account-metas";
+const POSITION_NFT_SEED: &[u8] = b"position_nft";
+const POSITION_NFT_V16_MAGIC: u64 = 0x5045_5243_4E46_5400; // "PERCNFT\0"
+const POSITION_NFT_V16_VERSION: u8 = 2;
+const POSITION_NFT_V16_LEN: usize = 199;
+const EXTRA_META_ENTRY_LEN: usize = 35;
+const EXTRA_META_COUNT: usize = 7;
+const EXTRA_METAS_ACCOUNT_LEN: usize = 8 + 4 + 4 + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT;
+const EXECUTE_DISCRIMINATOR: [u8; 8] = [105, 37, 101, 197, 75, 251, 102, 26];
+const IX_TRANSFER_CHECKED: u8 = 12;
+
+fn ata_address(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[wallet.as_ref(), TOKEN_2022.as_ref(), mint.as_ref()],
+        &ATA_PROGRAM,
+    )
+    .0
+}
+fn extra_metas_pda(mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[EXTRA_METAS_SEED, mint.as_ref()], &NFT_PROGRAM_ID)
+}
+fn position_nft_pda(portfolio: &Pubkey, asset_index: u16) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[POSITION_NFT_SEED, portfolio.as_ref(), &asset_index.to_le_bytes()],
+        &NFT_PROGRAM_ID,
+    )
+}
+fn mint_auth_pda() -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"mint_authority"], &NFT_PROGRAM_ID)
+}
+fn nft_registry_pda(market: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[NFT_REGISTRY_SEED, market.as_ref()], &PERCOLATOR_MAINNET)
+}
+
+/// Craft PositionNftV16 state bytes (199 bytes) — exact on-chain layout.
+fn nft_pda_data(
+    portfolio: &Pubkey,
+    nft_mint: &Pubkey,
+    asset_index: u16,
+    market_id: u64,
+    bump: u8,
+) -> Vec<u8> {
+    let mut d = vec![0u8; POSITION_NFT_V16_LEN];
+    d[0..8].copy_from_slice(&POSITION_NFT_V16_MAGIC.to_le_bytes());
+    d[8] = POSITION_NFT_V16_VERSION;
+    d[9] = bump;
+    d[10..42].copy_from_slice(portfolio.as_ref());
+    d[42..74].copy_from_slice(nft_mint.as_ref());
+    d[74..78].copy_from_slice(&(asset_index as u32).to_le_bytes());
+    d[78] = 0; // side_at_mint
+    let basis: i128 = 1_000_000;
+    d[79..95].copy_from_slice(&basis.to_le_bytes());
+    d[95..111].copy_from_slice(&0i128.to_le_bytes());
+    d[111..119].copy_from_slice(&market_id.to_le_bytes());
+    d[119..127].copy_from_slice(&0u64.to_le_bytes());
+    d[159..167].copy_from_slice(&1_700_000_000i64.to_le_bytes());
+    d
+}
+
+/// Craft an ExtraAccountMetaList account (7 entries) — the exact hook-extra order.
+fn extra_metas_data(
+    nft_pda: &Pubkey,
+    portfolio: &Pubkey,
+    mint_auth: &Pubkey,
+    registry: &Pubkey,
+) -> Vec<u8> {
+    let mut d = vec![0u8; EXTRA_METAS_ACCOUNT_LEN];
+    d[0..8].copy_from_slice(&EXECUTE_DISCRIMINATOR);
+    let tlv_value_len: u32 = (4 + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT) as u32;
+    d[8..12].copy_from_slice(&tlv_value_len.to_le_bytes());
+    d[12..16].copy_from_slice(&(EXTRA_META_COUNT as u32).to_le_bytes());
+    let entries: [(Pubkey, bool, bool); EXTRA_META_COUNT] = [
+        (*nft_pda, false, true),                    // [5] PositionNft PDA — writable
+        (*portfolio, false, true),                  // [6] Portfolio — writable
+        (PERCOLATOR_MAINNET, false, false),         // [7] Percolator program
+        (*mint_auth, false, false),                 // [8] Mint authority
+        (sysvar::instructions::id(), false, false), // [9] Instructions sysvar
+        (NFT_PROGRAM_ID, false, false),             // [10] NFT program (self)
+        (*registry, false, false),                  // [11] NFT registry
+    ];
+    for (i, (key, is_signer, is_writable)) in entries.iter().enumerate() {
+        let off = 16 + i * EXTRA_META_ENTRY_LEN;
+        d[off] = 0; // FixedPubkey discriminator
+        d[off + 1..off + 33].copy_from_slice(key.as_ref());
+        d[off + 33] = if *is_signer { 1 } else { 0 };
+        d[off + 34] = if *is_writable { 1 } else { 0 };
+    }
+    d
+}
+
+/// Build a minimal valid portfolio account (16-byte header + POD), active leg.
+fn portfolio_data(
+    portfolio_key: &Pubkey,
+    market: &Pubkey,
+    owner: &[u8; 32],
+    asset_index: u32,
+    market_id: u64,
+    basis_pos_q: i128,
+) -> Vec<u8> {
+    let mut p = PortfolioAccountV16Account::default();
+    p.provenance_header = ProvenanceHeaderV16Account {
+        market_group_id: market.to_bytes(),
+        portfolio_account_id: portfolio_key.to_bytes(),
+        owner: *owner,
+        version: V16PodU16::new(V16_ACCOUNT_VERSION),
+        layout_discriminator: V16PodU16::new(V16_LAYOUT_DISCRIMINATOR),
+    };
+    p.owner = *owner;
+    p.legs[0] = PortfolioLegV16Account {
+        active: 1,
+        asset_index: V16PodU32::new(asset_index),
+        market_id: V16PodU64::new(market_id),
+        basis_pos_q: V16PodI128::new(basis_pos_q),
+        ..Default::default()
+    };
+    let pod_len = core::mem::size_of::<PortfolioAccountV16Account>();
+    let mut data = vec![0u8; HEADER_LEN + pod_len];
+    data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+    data[8..10].copy_from_slice(&VERSION.to_le_bytes());
+    data[10] = KIND_PORTFOLIO;
+    data[HEADER_LEN..HEADER_LEN + pod_len].copy_from_slice(bytemuck::bytes_of(&p));
+    data
+}
+
+fn read_portfolio_owner(data: &[u8]) -> [u8; 32] {
+    let owner_off = HEADER_LEN + 100;
+    data[owner_off..owner_off + 32].try_into().unwrap()
+}
+fn read_provenance_owner(data: &[u8]) -> [u8; 32] {
+    let prov_owner_off = HEADER_LEN + 64;
+    data[prov_owner_off..prov_owner_off + 32].try_into().unwrap()
+}
+
+/// Real Token-2022 mint init via CPI: create + InitializeTransferHook +
+/// InitializeMintCloseAuthority + InitializeMint2. (verbatim v16_nft_e2e:612-690)
+fn initialize_token2022_mint_with_hook(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint_kp: &Keypair,
+    hook_program_id: &Pubkey,
+) {
+    let mint_space: usize = 270;
+    let lamports = svm.minimum_balance_for_rent_exemption(mint_space);
+
+    let mut hook_init_data = Vec::with_capacity(66);
+    hook_init_data.push(36u8); // TRANSFER_HOOK_EXTENSION_TAG
+    hook_init_data.push(0u8); // initialize sub-tag
+    hook_init_data.extend_from_slice(&[0u8; 32]); // authority = None
+    hook_init_data.extend_from_slice(hook_program_id.as_ref());
+    let hook_init_ix = Instruction {
+        program_id: TOKEN_2022,
+        accounts: vec![AccountMeta::new(mint_kp.pubkey(), false)],
+        data: hook_init_data,
+    };
+
+    let (nft_mint_auth_key, _) = mint_auth_pda();
+    let mut close_auth_data = Vec::with_capacity(34);
+    close_auth_data.push(25u8); // IX_INITIALIZE_MINT_CLOSE_AUTHORITY
+    close_auth_data.push(1u8); // COption::Some
+    close_auth_data.extend_from_slice(nft_mint_auth_key.as_ref());
+    let close_auth_ix = Instruction {
+        program_id: TOKEN_2022,
+        accounts: vec![AccountMeta::new(mint_kp.pubkey(), false)],
+        data: close_auth_data,
+    };
+
+    let mut init_mint_data = Vec::with_capacity(35);
+    init_mint_data.push(20u8); // IX_INITIALIZE_MINT2
+    init_mint_data.push(0u8); // decimals
+    init_mint_data.extend_from_slice(payer.pubkey().as_ref());
+    init_mint_data.push(0u8); // no freeze authority
+    let init_mint_ix = Instruction {
+        program_id: TOKEN_2022,
+        accounts: vec![AccountMeta::new(mint_kp.pubkey(), false)],
+        data: init_mint_data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &mint_kp.pubkey(),
+                lamports,
+                mint_space as u64,
+                &TOKEN_2022,
+            ),
+            hook_init_ix,
+            close_auth_ix,
+            init_mint_ix,
+        ],
+        Some(&payer.pubkey()),
+        &[payer, mint_kp],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .expect("initialize Token-2022 mint with transfer hook");
+}
+
+/// Create a Token-2022 ATA via the ATA program. (verbatim v16_nft_e2e:692-719)
+fn create_ata(svm: &mut LiteSVM, payer: &Keypair, wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+    let ata_key = ata_address(wallet, mint);
+    let ix = Instruction {
+        program_id: ATA_PROGRAM,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(ata_key, false),
+            AccountMeta::new_readonly(*wallet, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(TOKEN_2022, false),
+        ],
+        data: vec![0u8], // Create
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx).expect("create ATA");
+    ata_key
+}
+
+/// Mint 1 NFT to an ATA (payer = mint authority). (verbatim v16_nft_e2e:722-743)
+fn mint_one_to_ata(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, ata: &Pubkey) {
+    let mut data = Vec::with_capacity(9);
+    data.push(7u8); // IX_MINT_TO
+    data.extend_from_slice(&1u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: TOKEN_2022,
+        accounts: vec![
+            AccountMeta::new(*mint, false),
+            AccountMeta::new(*ata, false),
+            AccountMeta::new_readonly(payer.pubkey(), true),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx).expect("mint 1 NFT to ATA");
+}
+
+/// Token-2022 TransferChecked with the 8 hook extras. (verbatim v16_nft_e2e:1006-1042)
+#[allow(clippy::too_many_arguments)]
+fn transfer_checked_ix(
+    source_ata: &Pubkey,
+    nft_mint: &Pubkey,
+    dest_ata: &Pubkey,
+    source_owner: &Pubkey,
+    extra_metas: &Pubkey,
+    nft_pda: &Pubkey,
+    portfolio: &Pubkey,
+    mint_auth: &Pubkey,
+    registry: &Pubkey,
+) -> Instruction {
+    let mut data = Vec::with_capacity(10);
+    data.push(IX_TRANSFER_CHECKED);
+    data.extend_from_slice(&1u64.to_le_bytes()); // amount = 1
+    data.push(0u8); // decimals = 0
+    Instruction {
+        program_id: TOKEN_2022,
+        accounts: vec![
+            AccountMeta::new(*source_ata, false),
+            AccountMeta::new_readonly(*nft_mint, false),
+            AccountMeta::new(*dest_ata, false),
+            AccountMeta::new_readonly(*source_owner, true),
+            AccountMeta::new_readonly(*extra_metas, false),
+            AccountMeta::new(*nft_pda, false),
+            AccountMeta::new(*portfolio, false),
+            AccountMeta::new_readonly(PERCOLATOR_MAINNET, false),
+            AccountMeta::new_readonly(*mint_auth, false),
+            AccountMeta::new_readonly(sysvar::instructions::id(), false),
+            AccountMeta::new_readonly(NFT_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*registry, false),
+        ],
+        data,
+    }
+}
+
+/// Place the full NFT bundle on a fresh crafted portfolio bound to `market`:
+/// real Token-2022 mint + ATA + 1 token, plus injected PositionNft / ExtraMetas /
+/// mint-authority PDAs. Returns the keys. (adapts place_nft_bundle_real_mint)
+#[allow(clippy::type_complexity)]
+fn place_nft_bundle(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    market: &Pubkey,
+    registry: &Pubkey,
+    owner_wallet: &Keypair,
+    asset_index: u16,
+    market_id: u64,
+    basis_pos_q: i128,
+) -> (Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, (Pubkey, u8)) {
+    let portfolio_key = Pubkey::new_unique();
+    let nft_mint_kp = Keypair::new();
+    let nft_mint_key = nft_mint_kp.pubkey();
+    let (nft_pda_key, nft_bump) = position_nft_pda(&portfolio_key, asset_index);
+    let (extra_metas_key, _) = extra_metas_pda(&nft_mint_key);
+    let (mint_auth_key, mint_auth_bump) = mint_auth_pda();
+    let owner_bytes = owner_wallet.pubkey().to_bytes();
+    let source_ata_key = ata_address(&owner_wallet.pubkey(), &nft_mint_key);
+
+    initialize_token2022_mint_with_hook(svm, payer, &nft_mint_kp, &NFT_PROGRAM_ID);
+    create_ata(svm, payer, &owner_wallet.pubkey(), &nft_mint_key);
+    mint_one_to_ata(svm, payer, &nft_mint_key, &source_ata_key);
+
+    let port_data = portfolio_data(
+        &portfolio_key,
+        market,
+        &owner_bytes,
+        asset_index as u32,
+        market_id,
+        basis_pos_q,
+    );
+    svm.set_account(
+        portfolio_key,
+        Account {
+            lamports: 10_000_000_000,
+            data: port_data,
+            owner: PERCOLATOR_MAINNET,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(
+        nft_pda_key,
+        Account {
+            lamports: 2_000_000,
+            data: nft_pda_data(&portfolio_key, &nft_mint_key, asset_index, market_id, nft_bump),
+            owner: NFT_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(
+        extra_metas_key,
+        Account {
+            lamports: 2_000_000,
+            data: extra_metas_data(&nft_pda_key, &portfolio_key, &mint_auth_key, registry),
+            owner: NFT_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(
+        mint_auth_key,
+        Account {
+            lamports: 1_000_000,
+            data: vec![],
+            owner: NFT_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    (
+        portfolio_key,
+        nft_pda_key,
+        nft_mint_key,
+        source_ata_key,
+        extra_metas_key,
+        (mint_auth_key, mint_auth_bump),
+    )
+}
+
+impl CrosscutEnv {
+    /// SetNftProgramId (tag 73) — registers the NFT program for this market and
+    /// creates the NftRegistry PDA. Returns the registry key.
+    fn register_nft_program(&mut self) -> Pubkey {
+        let (registry, _) = nft_registry_pda(&self.market);
+        let admin = self.admin.insecure_clone();
+        self.try_wrapper(
+            ProgInstruction::SetNftProgramId {
+                nft_program_id: NFT_PROGRAM_ID.to_bytes(),
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(self.market, false),
+                AccountMeta::new(registry, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect("SetNftProgramId");
+        registry
+    }
+}
+
+/// 3A.1d — SetNftProgramId + a REAL Token-2022 TransferChecked → transfer-hook →
+/// wrapper B-3 ownership change, in the 5-program instance on the CrosscutEnv
+/// market (which also hosts the LP vault + matcher). The successful hook→B-3 CPI
+/// proves the per-market NftRegistry's nft_program_id is byte-correct.
+#[test]
+fn x0_nft_transfer_hook_b3_ownership_at_mainnet() {
+    let mut env = CrosscutEnv::new();
+    let registry = env.register_nft_program();
+    assert_eq!(
+        env.svm.get_account(&registry).unwrap().owner,
+        PERCOLATOR_MAINNET,
+        "SetNftProgramId created the registry owned by the wrapper"
+    );
+
+    let source_wallet = Keypair::new();
+    env.svm.airdrop(&source_wallet.pubkey(), 10_000_000_000).unwrap();
+    let dest_wallet = Keypair::new();
+    env.svm.airdrop(&dest_wallet.pubkey(), 10_000_000_000).unwrap();
+
+    let (portfolio, nft_pda, nft_mint, source_ata, extra_metas, (mint_auth, _)) =
+        place_nft_bundle(&mut env.svm, &env.payer, &env.market, &registry, &source_wallet, 0, 42, 1_000_000);
+
+    let dest_ata = create_ata(&mut env.svm, &env.payer, &dest_wallet.pubkey(), &nft_mint);
+
+    let transfer_ix = transfer_checked_ix(
+        &source_ata,
+        &nft_mint,
+        &dest_ata,
+        &source_wallet.pubkey(),
+        &extra_metas,
+        &nft_pda,
+        &portfolio,
+        &mint_auth,
+        &registry,
+    );
+    let res = send_ixs(&mut env.svm, &env.payer, vec![transfer_ix], &[&source_wallet]);
+    assert!(
+        res.is_ok(),
+        "Token-2022 TransferChecked → hook → B-3 must succeed in the 5-program instance: {res:?}"
+    );
+
+    // Executed guard: B-3 set portfolio.owner (and provenance) to the dest WALLET.
+    let port_data = env.account_data(portfolio);
+    assert_eq!(
+        read_portfolio_owner(&port_data),
+        dest_wallet.pubkey().to_bytes(),
+        "portfolio.owner == dest WALLET (not the ATA)"
+    );
+    assert_eq!(
+        read_provenance_owner(&port_data),
+        dest_wallet.pubkey().to_bytes(),
+        "provenance_header.owner dual-write"
+    );
+    assert_ne!(
+        read_portfolio_owner(&port_data),
+        dest_ata.to_bytes(),
+        "owner must NOT be the ATA address"
+    );
+
+    // Executed guard: the NFT actually moved.
+    let dest_ata_data = env.account_data(dest_ata);
+    assert_eq!(
+        u64::from_le_bytes(dest_ata_data[64..72].try_into().unwrap()),
+        1,
+        "dest ATA holds 1 NFT after transfer"
+    );
+}
+
+/// 3A.1e — X6-LEDGER: end-to-end COLLATERAL conservation across the assembled
+/// lifecycle (user deposits → matcher trade → LP deposit → LP redeem). The
+/// collateral mint is never minted/burned by the wrapper — tokens only move — so
+/// the sum across every collateral account is invariant. Plus per-checkpoint
+/// `group.vault == on-chain vault` and the matcher seam `c_tot + insurance ==
+/// vault` (no value created at the cross-program seams).
+#[test]
+fn x6_ledger_collateral_conservation_across_lifecycle() {
+    let mut env = CrosscutEnv::new();
+    env.lp_create(0, 0);
+
+    let d: u128 = 1_000_000; // per-trader user deposit
+    let l: u128 = 500_000; // LP deposit
+    let total_created = 2 * d + l;
+
+    // Traders deposit (user collateral → vault).
+    let owner_a = Keypair::new();
+    let owner_b = Keypair::new();
+    let pa = env.create_portfolio(&owner_a);
+    let pb = env.create_portfolio(&owner_b);
+    let src_a = env.deposit(&owner_a, pa, d);
+    let src_b = env.deposit(&owner_b, pb, d);
+    assert_eq!(env.token_amount(env.vault), (2 * d) as u64, "vault holds 2 user deposits");
+    assert_eq!(env.group().vault, 2 * d, "group.vault ledger == user collateral");
+
+    // Matcher trade — opens positions; fee is internal (capital → insurance),
+    // no collateral enters/leaves the vault.
+    let (ctx, delegate) = env.init_matcher_context(pb);
+    env.trade_cpi(&owner_a, pa, &owner_b, pb, ctx, delegate, CROSSCUT_ASSET, (10 * POS_SCALE) as i128, 100)
+        .expect("matcher trade");
+    // Executed guard: a REAL fill happened (so conservation isn't trivially met by a no-op).
+    assert_eq!(
+        active_leg_basis(&env.portfolio(pa), CROSSCUT_ASSET),
+        (10 * POS_SCALE) as i128,
+        "matcher opened a real position (conservation is non-trivial)"
+    );
+    let g = env.group();
+    assert_eq!(env.token_amount(env.vault), (2 * d) as u64, "matcher seam moves no collateral");
+    assert_eq!(g.c_tot + g.insurance, g.vault, "c_tot + insurance == vault (no value created)");
+    assert_eq!(g.vault, 2 * d, "group.vault conserved through the trade");
+
+    // LP deposit (collateral → same vault, tracked in the backing ledger).
+    let lp = Keypair::new();
+    env.svm.airdrop(&lp.pubkey(), 1_000_000_000).unwrap();
+    let (lp_ata, src_lp) = env.lp_deposit(&lp, l);
+    assert_eq!(env.token_amount(env.vault), (2 * d + l) as u64, "vault now holds user + LP collateral");
+
+    // LP redeem (collateral → dest, 1:1 with no earnings).
+    let redemption = state::derive_lp_redemption(&env.program_id, &env.lp_registry, &lp.pubkey()).0;
+    env.lp_request_redeem(&lp, redemption, lp_ata, l);
+    let dest_lp = env.lp_execute_redeem(&lp, redemption);
+    assert_eq!(env.token_amount(env.vault), (2 * d) as u64, "vault back to user collateral after redeem");
+    assert_eq!(env.token_amount(dest_lp), l as u64, "LP redeemed 1:1");
+
+    // ── Conservation: Σ collateral across every collateral account == created. ──
+    // (lp_ata / lp_escrow hold LP SHARES, a different mint — excluded.)
+    let sum_collateral = env.token_amount(src_a) as u128
+        + env.token_amount(src_b) as u128
+        + env.token_amount(src_lp) as u128
+        + env.token_amount(dest_lp) as u128
+        + env.token_amount(env.vault) as u128;
+    assert_eq!(
+        sum_collateral, total_created,
+        "no collateral created or destroyed across deposit→trade→LP-deposit→redeem"
+    );
+    // LP-share mint nets to zero (minted on deposit, burned on redeem).
+    let reg = state::read_lp_vault_registry(&env.account_data(env.lp_registry)).unwrap();
+    assert_eq!(reg.total_lp_shares_outstanding, 0, "LP shares net to zero");
+}
+
+/// 3A.1b — a real matcher `TradeCpi` fires through the loaded `percolator_match`
+/// `.so` at MAINNET, coexisting with the Token-2022 / NFT / stake programs in one
+/// instance. The matcher-delegate PDA derives under MAINNET on both sides.
+#[test]
+fn x0_matcher_tradecpi_real_fill_at_mainnet() {
+    let mut env = CrosscutEnv::new();
+    let taker_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let taker = env.create_portfolio(&taker_owner);
+    let maker = env.create_portfolio(&maker_owner);
+    env.deposit(&taker_owner, taker, 1_000_000);
+    env.deposit(&maker_owner, maker, 1_000_000);
+
+    let (ctx, delegate) = env.init_matcher_context(maker);
+    env.trade_cpi(
+        &taker_owner,
+        taker,
+        &maker_owner,
+        maker,
+        ctx,
+        delegate,
+        CROSSCUT_ASSET,
+        (10 * POS_SCALE) as i128,
+        100,
+    )
+    .expect("matcher TradeCpi fill");
+
+    // Executed guard: the real matcher fill opened equal-and-opposite positions.
+    let taker_leg = active_leg_basis(&env.portfolio(taker), CROSSCUT_ASSET);
+    let maker_leg = active_leg_basis(&env.portfolio(maker), CROSSCUT_ASSET);
+    assert_eq!(taker_leg, (10 * POS_SCALE) as i128, "taker opened long via matcher");
+    assert_eq!(maker_leg, -((10 * POS_SCALE) as i128), "maker opened short via matcher");
+
+    // The loaded matcher .so actually ran (ABI v3 + echoes the requested asset).
+    let mdata = env.account_data(ctx);
+    assert_eq!(
+        u32::from_le_bytes(mdata[0..4].try_into().unwrap()),
+        MATCHER_ABI_VERSION,
+        "matcher used the v3 ABI"
+    );
+    assert_eq!(
+        u64::from_le_bytes(mdata[56..64].try_into().unwrap()),
+        CROSSCUT_ASSET as u64,
+        "matcher echoes the requested asset index in the v3 return slot"
+    );
+
+    // Conservation through the matcher seam: no value created.
+    let g = env.group();
+    assert_eq!(g.c_tot + g.insurance, g.vault, "c_tot + insurance == vault");
 }
