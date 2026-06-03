@@ -318,9 +318,9 @@ impl V16CuEnv {
         let admin = Keypair::new();
         let market = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let vault = Pubkey::new_unique();
         let vault_authority =
             Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id).0;
+        let vault = canonical_vault_ata(&vault_authority, &mint);
         svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
         svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
         svm.set_account(
@@ -735,6 +735,25 @@ impl V16CuEnv {
                 Account {
                     lamports: 1_000_000_000,
                     data: make_token_data(mint, owner, amount),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        token
+    }
+
+    /// A vault token account at the CANONICAL ATA address for `mint`, owned by vault_authority
+    /// (W3 F-VAULT-FRAG pin) — for the secondary-mint vault on the offset-pair swap path.
+    fn vault_token_for_mint(&mut self, mint: Pubkey, amount: u64) -> Pubkey {
+        let token = canonical_vault_ata(&self.vault_authority, &mint);
+        self.svm
+            .set_account(
+                token,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(mint, self.vault_authority, amount),
                     owner: spl_token::ID,
                     executable: false,
                     rent_epoch: 0,
@@ -7739,7 +7758,7 @@ fn v16_bpf_policy_authority_and_base_unit_tags_are_bounded_and_persist() {
 
     let primary_source = env.token_account_for_mint(env.mint, env.admin.pubkey(), 50);
     let secondary_dest = env.token_account_for_mint(secondary_mint, env.admin.pubkey(), 0);
-    let secondary_vault = env.token_account_for_mint(secondary_mint, env.vault_authority, 50);
+    let secondary_vault = env.vault_token_for_mint(secondary_mint, 50);
     let before_swap_market = env.svm.get_account(&env.market).unwrap().data;
     let swap_cu = env.swap_secondary_for_primary_with_cu(
         primary_source,
@@ -8083,4 +8102,16 @@ fn v16_bpf_resolved_payout_tags_are_bounded_and_update_state() {
         group.resolved_payout_ledger.current_payout_rate_den,
         90 * BOUND_SCALE
     );
+}
+
+// W3 (canonical-ATA): mirror of v16_program::processor::canonical_vault_address — the SPL
+// Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
+// the program so the BPF vault fixture satisfies the F-VAULT-FRAG pin.
+fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    Pubkey::find_program_address(
+        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &ata_program,
+    )
+    .0
 }

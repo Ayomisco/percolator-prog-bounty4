@@ -281,7 +281,7 @@ fn vault_authority(market: &TestAccount) -> Pubkey {
 
 fn vault_token_account(market: &TestAccount, mint: Pubkey, amount: u64) -> TestAccount {
     TestAccount::new_with_data(
-        Pubkey::new_unique(),
+        canonical_vault_ata(&vault_authority(market), &mint),
         spl_token::ID,
         make_token_data(mint, vault_authority(market), amount),
     )
@@ -295,7 +295,7 @@ fn vault_token_account_with_state(
     state: AccountState,
 ) -> TestAccount {
     TestAccount::new_with_data(
-        Pubkey::new_unique(),
+        canonical_vault_ata(&vault_authority(market), &mint),
         spl_token::ID,
         make_token_data_with_state(mint, vault_authority(market), amount, state),
     )
@@ -310,7 +310,7 @@ fn vault_token_account_with_controls(
     close_authority: COption<Pubkey>,
 ) -> TestAccount {
     TestAccount::new_with_data(
-        Pubkey::new_unique(),
+        canonical_vault_ata(&vault_authority(market), &mint),
         spl_token::ID,
         make_token_data_with_controls(
             mint,
@@ -17103,4 +17103,109 @@ fn v16_attack_tradenocpi_fee_cannot_be_evaded_via_exec_price() {
         lowball, honest,
         "lowball exec_price=1 must pay the SAME full mark-based fee — fee evasion is closed"
     );
+}
+
+// W3 (canonical-ATA): mirror of v16_program::processor::canonical_vault_address — the SPL
+// Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
+// the program so vault fixtures satisfy the F-VAULT-FRAG pin (a green test == the derivation matches).
+fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    Pubkey::find_program_address(
+        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &ata_program,
+    )
+    .0
+}
+
+// ── W3 (F-VAULT-FRAG) canonical-ATA pin: operative reject-noncanonical / accept-canonical ──
+// A vault_authority-owned token account at any address OTHER than the canonical ATA must be
+// rejected with the EXACT InvalidVaultAccount (Custom 12) — the wrong-reason guard (assert_eq on
+// the exact code) proves the rejection is the address pin, not an unrelated failure. Without the
+// pin an attacker funds a second vault-authority-owned account and fragments liquidity.
+
+fn noncanonical_vault_token_account(market: &TestAccount, mint: Pubkey, amount: u64) -> TestAccount {
+    // Correct owner + mint + state — ONLY the address is wrong (random, not the canonical ATA).
+    TestAccount::new_with_data(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        make_token_data(mint, vault_authority(market), amount),
+    )
+    .writable()
+}
+
+#[test]
+fn v16_wrapper_deposit_rejects_noncanonical_vault() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    let mint = Pubkey::new_from_array(state::read_market(&market.data).unwrap().0.collateral_mint);
+
+    let mut source_token = user_token_account(owner.key, mint, 1_000_000);
+    let mut bad_vault = noncanonical_vault_token_account(&market, mint, 0);
+    let mut token_program = token_program_account();
+    let rejected = run_ix(
+        Instruction::Deposit { amount: 1_000_000 },
+        &mut [&mut owner, &mut market, &mut portfolio, &mut source_token, &mut bad_vault, &mut token_program],
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(12)),
+        "Deposit to a non-canonical vault must reject with InvalidVaultAccount (Custom 12)"
+    );
+    // The canonical vault (the ATA) is accepted.
+    deposit(&mut owner, &mut market, &mut portfolio, 1_000_000);
+}
+
+#[test]
+fn v16_wrapper_withdraw_rejects_noncanonical_vault() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 1_000_000);
+    let mint = Pubkey::new_from_array(state::read_market(&market.data).unwrap().0.collateral_mint);
+
+    let mut dest_token = user_token_account(owner.key, mint, 0);
+    let mut bad_vault = noncanonical_vault_token_account(&market, mint, 1_000_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let rejected = run_ix(
+        Instruction::Withdraw { amount: 500_000 },
+        &mut [&mut owner, &mut market, &mut portfolio, &mut dest_token, &mut bad_vault, &mut vault_auth, &mut token_program],
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(12)),
+        "Withdraw from a non-canonical vault must reject with InvalidVaultAccount (Custom 12)"
+    );
+    // The canonical vault is accepted.
+    withdraw(&mut owner, &mut market, &mut portfolio, 500_000);
+}
+
+#[test]
+fn v16_wrapper_topup_backing_bucket_rejects_noncanonical_vault() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    let mint = Pubkey::new_from_array(state::read_market(&market.data).unwrap().0.collateral_mint);
+
+    let mut source = user_token_account(admin.key, mint, 1_000_000);
+    let mut bad_vault = noncanonical_vault_token_account(&market, mint, 0);
+    let mut token_program = token_program_account();
+    let rejected = run_ix(
+        Instruction::TopUpBackingBucket { domain: 0, amount: 1_000, expiry_slot: 1_000_000 },
+        &mut [&mut admin, &mut market, &mut source, &mut bad_vault, &mut token_program],
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(12)),
+        "TopUpBackingBucket to a non-canonical vault must reject with InvalidVaultAccount (Custom 12)"
+    );
+    // The canonical vault is accepted.
+    top_up_backing_bucket(&mut admin, &mut market, 0, 1_000, 1_000_000);
 }

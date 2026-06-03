@@ -185,7 +185,7 @@ fn setup_vault_oi(cooldown_slots: u64, oi_reservation_threshold_bps: u16) -> Env
     let (ledger, _) = derive_lp_backing_ledger(&program_id, &market, DOMAIN);
     let (escrow, _) = derive_lp_escrow(&program_id, &market);
     let (vault_authority, _) = Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
-    let vault_token = Pubkey::new_unique();
+    let vault_token = canonical_vault_ata(&vault_authority, &collateral_mint);
     set_token(&mut svm, vault_token, collateral_mint, vault_authority, 0);
 
     // Append asset 1 with registry as backing authority, then create vault.
@@ -477,7 +477,7 @@ fn setup_vault_admin_authority() -> Env {
     let (ledger, _) = derive_lp_backing_ledger(&program_id, &market, DOMAIN);
     let (escrow, _) = derive_lp_escrow(&program_id, &market);
     let (vault_authority, _) = Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
-    let vault_token = Pubkey::new_unique();
+    let vault_token = canonical_vault_ata(&vault_authority, &collateral_mint);
     set_token(&mut svm, vault_token, collateral_mint, vault_authority, 0);
     send(&mut svm, program_id, &payer, vec![(ProgInstruction::UpdateAssetLifecycle {
         action: ASSET_ACTION_ACTIVATE, asset_index: APPEND_ASSET_INDEX, now_slot: 1, initial_price: 100,
@@ -503,4 +503,76 @@ fn execute_redemption_oi_reservation_violation_rejects() {
     let res = execute(&mut env, &d);
     let msg = format!("{res:?}");
     assert!(msg.contains("Custom(37)"), "expected LpVaultOiReservationViolated Custom(37), got: {msg}");
+}
+
+// W3 (canonical-ATA): mirror of v16_program::processor::canonical_vault_address — the SPL
+// Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
+// the program so vault fixtures satisfy the F-VAULT-FRAG pin (a green test == the derivation matches).
+fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    Pubkey::find_program_address(
+        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &ata_program,
+    )
+    .0
+}
+
+// ── W3 (F-VAULT-FRAG) canonical-ATA pin on the LP-vault collateral paths ──
+// DepositToLpVault and ExecuteRedemption both verify the collateral vault is the canonical ATA of
+// the vault_authority for the mint. A vault_authority-owned account at any other address is rejected
+// with InvalidVaultAccount (Custom 12), so a fragmenting second vault cannot strand LP redemptions.
+// The dual-gate ACCEPT path (a real deposit -> request -> execute that pays pro-rata and DRAINS the
+// canonical env.vault_token) is proven by request_then_execute_pays_pro_rata above.
+
+fn noncanonical_vault(env: &mut Env, amount: u64) -> Pubkey {
+    let bad = Pubkey::new_unique();
+    set_token(&mut env.svm, bad, env.collateral_mint, env.vault_authority, amount);
+    bad
+}
+
+#[test]
+fn deposit_to_lp_vault_rejects_noncanonical_vault() {
+    let mut env = setup_vault(0);
+    let kp = Keypair::new();
+    env.svm.airdrop(&kp.pubkey(), 100_000_000_000).unwrap();
+    let source = Pubkey::new_unique();
+    set_token(&mut env.svm, source, env.collateral_mint, kp.pubkey(), 10_000_000);
+    let lp_ata = Pubkey::new_unique();
+    set_token(&mut env.svm, lp_ata, env.lp_mint, kp.pubkey(), 0);
+    let bad_vault = noncanonical_vault(&mut env, 0);
+
+    let mut accts = deposit_accounts(&env, lp_ata, source, kp.pubkey());
+    accts[6] = AccountMeta::new(bad_vault, false); // swap the canonical vault for a fragmenting one
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount: DEPOSIT }, accts)], &[&kp]);
+    let msg = res.expect_err("DepositToLpVault to a non-canonical vault must reject");
+    assert!(msg.contains("Custom(12)"), "expected InvalidVaultAccount Custom(12), got: {msg}");
+
+    // ACCEPT: the canonical vault deposit goes through.
+    let d = new_depositor(&mut env, DEPOSIT);
+    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64, "canonical-vault deposit accepted");
+}
+
+#[test]
+fn execute_redemption_rejects_noncanonical_vault() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    request(&mut env, &d, DEPOSIT).expect("request");
+    env.svm.expire_blockhash();
+
+    let mut accts = execute_accounts(&env, &d);
+    accts[6] = AccountMeta::new(noncanonical_vault(&mut env, DEPOSIT as u64), false); // fragmenting vault
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption, accts)], &[]);
+    let msg = res.expect_err("ExecuteRedemption from a non-canonical vault must reject");
+    assert!(msg.contains("Custom(12)"), "expected InvalidVaultAccount Custom(12), got: {msg}");
+
+    // The rejected execute reverted; the redemption is still pending and the CANONICAL vault still
+    // executes (dual-gate intact) — draining env.vault_token, as proven end-to-end above.
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("canonical-vault execute accepted");
+    assert_eq!(tok(&env.svm, env.vault_token), 0, "canonical vault drained on accept");
+    assert_eq!(tok(&env.svm, d.dest), DEPOSIT as u64, "redeemer paid pro-rata through the canonical vault");
 }

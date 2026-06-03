@@ -364,10 +364,10 @@ impl CrosscutEnv {
         let admin = Keypair::new();
         let market = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let vault = Pubkey::new_unique();
         // PDA derived under MAINNET — the error-prone re-key.
         let (vault_authority, _) =
             Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
+        let vault = canonical_vault_ata(&vault_authority, &mint);
 
         svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
         svm.airdrop(&admin.pubkey(), 1_000_000_000_000).unwrap();
@@ -2191,4 +2191,16 @@ fn x0_matcher_tradecpi_real_fill_at_mainnet() {
     // Conservation through the matcher seam: no value created.
     let g = env.group();
     assert_eq!(g.c_tot + g.insurance, g.vault, "c_tot + insurance == vault");
+}
+
+// W3 (canonical-ATA): mirror of v16_program::processor::canonical_vault_address — the SPL
+// Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
+// the program so vault fixtures satisfy the F-VAULT-FRAG pin (a green test == the derivation matches).
+fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    Pubkey::find_program_address(
+        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &ata_program,
+    )
+    .0
 }

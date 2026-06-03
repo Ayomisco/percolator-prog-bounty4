@@ -12646,6 +12646,26 @@ pub mod processor {
         Pubkey::find_program_address(&[b"vault", market_key.as_ref()], program_id)
     }
 
+    /// The SPL Associated Token Account program — used to derive the single CANONICAL vault address.
+    const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+        solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+
+    /// The canonical vault for a market+mint is the Associated Token Account of the vault_authority
+    /// PDA for that mint. Pinning the vault to this single deterministic address (F-VAULT-FRAG)
+    /// rejects any other vault_authority-owned token account, preventing the liquidity
+    /// fragmentation that could strand honest withdrawals.
+    fn canonical_vault_address(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(
+            &[
+                vault_authority.as_ref(),
+                spl_token::ID.as_ref(),
+                mint.as_ref(),
+            ],
+            &ASSOCIATED_TOKEN_PROGRAM_ID,
+        )
+        .0
+    }
+
     fn expect_key(ai: &AccountInfo, expected: &Pubkey) -> Result<(), ProgramError> {
         if ai.key != expected {
             return Err(ProgramError::InvalidArgument);
@@ -12761,6 +12781,10 @@ pub mod processor {
             || vault.state != spl_token::state::AccountState::Initialized
             || vault.delegate.is_some()
             || vault.close_authority.is_some()
+            // F-VAULT-FRAG: pin to the single canonical vault address (the ATA of the vault_authority
+            // for this mint). Without this, ANY vault_authority-owned account is accepted, enabling
+            // liquidity fragmentation that strands honest withdrawals.
+            || *vault_token_ai.key != canonical_vault_address(expected_vault_owner, &vault.mint)
         {
             return Err(PercolatorError::InvalidVaultAccount.into());
         }
@@ -12780,6 +12804,9 @@ pub mod processor {
             || token.state != spl_token::state::AccountState::Initialized
             || token.delegate.is_some()
             || token.close_authority.is_some()
+            // F-VAULT-FRAG: pin to the single canonical vault address (the ATA of the vault_authority
+            // for this mint), rejecting any other vault_authority-owned token account.
+            || *token_ai.key != canonical_vault_address(expected_owner, expected_mint)
         {
             return Err(PercolatorError::InvalidVaultAccount.into());
         }

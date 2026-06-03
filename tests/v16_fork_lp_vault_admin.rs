@@ -118,7 +118,7 @@ fn setup_vault() -> Env {
     let (lp_mint, _) = derive_lp_vault_mint(&program_id, &market);
     let (ledger, _) = derive_lp_backing_ledger(&program_id, &market, DOMAIN);
     let (vault_authority, _) = Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
-    let vault_token = Pubkey::new_unique();
+    let vault_token = canonical_vault_ata(&vault_authority, &collateral_mint);
     set_token(&mut svm, vault_token, collateral_mint, vault_authority, 0);
 
     send(&mut svm, program_id, &payer, ProgInstruction::UpdateAssetLifecycle {
@@ -335,4 +335,16 @@ fn crank_fees_distributes_lp_share_after_earnings() {
     let grew = reg_after.fee_distribution_total_atoms - reg_before.fee_distribution_total_atoms;
     assert!(grew > 0, "LP fee distribution must grow after a fee crank");
     assert_eq!(grew, expected_lp_side, "lp_side must equal lp_fee_split(earnings, fee_share_bps).0");
+}
+
+// W3 (canonical-ATA): mirror of v16_program::processor::canonical_vault_address — the SPL
+// Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
+// the program so vault fixtures satisfy the F-VAULT-FRAG pin (a green test == the derivation matches).
+fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    Pubkey::find_program_address(
+        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &ata_program,
+    )
+    .0
 }
