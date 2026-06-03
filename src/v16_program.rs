@@ -3807,6 +3807,13 @@ pub mod oracle_v16 {
 
     fn apply_transform(raw_price: u64, invert: u8, unit_scale: u32) -> Result<u64, ProgramError> {
         let mut price = raw_price;
+        // Guard zero BEFORE the invert divide: a multi-leg `compose` with a divide leg can floor the
+        // accumulator to 0, and `1e12 / 0` would panic. A zero price is always OracleInvalid anyway
+        // (the post-transform check below already rejects it), so this only converts the panic into
+        // the same graceful error — no valid behavior changes (valid oracle prices are nonzero).
+        if price == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
         if invert != 0 {
             price = (1_000_000_000_000u128 / price as u128)
                 .try_into()
@@ -3819,6 +3826,39 @@ pub mod oracle_v16 {
             return Err(PercolatorError::OracleInvalid.into());
         }
         Ok(price)
+    }
+
+    #[cfg(test)]
+    mod w2_apply_transform_zero_guard {
+        use super::*;
+
+        // W2 (toly 00946cf): apply_transform must GUARD a zero price BEFORE the invert divide
+        // (`1e12 / 0`), converting a would-be panic into a graceful OracleInvalid. Driven directly
+        // here because the fn is private to oracle_v16 and the single-leg public path can deliver a
+        // 0 into it, whereas the multi-leg `compose` path already rejects 0 upstream (leg==0 / next==0).
+        #[test]
+        fn invert_of_zero_returns_oracle_invalid_not_panic() {
+            // Without the W2 guard this evaluates `1e12 / 0` and panics; with it, a clean error.
+            assert_eq!(
+                apply_transform(0, 1, 1),
+                Err(PercolatorError::OracleInvalid.into())
+            );
+        }
+
+        #[test]
+        fn zero_without_invert_still_oracle_invalid() {
+            // Behavior-preserving: a zero price was already rejected by the post-transform check.
+            assert_eq!(
+                apply_transform(0, 0, 1),
+                Err(PercolatorError::OracleInvalid.into())
+            );
+        }
+
+        #[test]
+        fn nonzero_invert_is_unchanged() {
+            // Valid (nonzero) prices are unaffected: 1e12 / 1e6 = 1e6.
+            assert_eq!(apply_transform(1_000_000, 1, 1), Ok(1_000_000));
+        }
     }
 
     fn compose(acc_e6: u64, leg_e6: u64, divide: bool) -> Result<u64, ProgramError> {
