@@ -34,7 +34,7 @@ use common::*;
 
 use litesvm::LiteSVM;
 use percolator::{
-    MarketGroupV16, PortfolioAccountV16, PortfolioAccountV16Account, PortfolioLegV16Account,
+    PortfolioAccountV16Account, PortfolioLegV16Account,
     ProvenanceHeaderV16Account, V16PodI128, V16PodU16, V16PodU32, V16PodU64, V16_ACCOUNT_VERSION,
     V16_LAYOUT_DISCRIMINATOR, POS_SCALE,
 };
@@ -44,7 +44,8 @@ use percolator_prog::{
     },
     ix::Instruction as ProgInstruction,
     processor::ASSET_ACTION_ACTIVATE,
-    state,
+    // v17: MarketGroupV16 and PortfolioAccountV16 are wrapper-side types in state (not engine).
+    state::{self, MarketGroupV16, PortfolioAccountV16},
 };
 use solana_sdk::{
     account::Account,
@@ -614,6 +615,9 @@ fn matcher_delegate_key(
     program_id: &Pubkey,
     market: &Pubkey,
     maker: &Pubkey,
+    // v17: maker_owner added to delegate derivation (auth overhaul, mirrors
+    // processor::derive_matcher_delegate seeds).
+    maker_owner: &Pubkey,
     matcher_program: &Pubkey,
     matcher_context: &Pubkey,
 ) -> Pubkey {
@@ -622,6 +626,7 @@ fn matcher_delegate_key(
             b"matcher",
             market.as_ref(),
             maker.as_ref(),
+            maker_owner.as_ref(),
             matcher_program.as_ref(),
             matcher_context.as_ref(),
         ],
@@ -648,15 +653,24 @@ fn active_leg_basis(p: &PortfolioAccountV16, asset_index: u16) -> i128 {
 }
 
 impl CrosscutEnv {
-    /// Create + initialize a passive matcher context bound to `maker_account`.
-    /// The delegate PDA derives under `self.program_id` (= MAINNET), matching the
-    /// wrapper's own derivation at trade time (v16_program.rs:7345/7352).
-    fn init_matcher_context(&mut self, maker_account: Pubkey) -> (Pubkey, Pubkey) {
+    /// Create + initialize a passive matcher context bound to `maker_account`, then
+    /// call SetMatcherConfig on the maker's portfolio so the wrapper's TradeCpi auth
+    /// check (matcher_tail_start_or_verify_lp_config) passes.
+    ///
+    /// v17: requires maker_owner as a keypair for delegate derivation (auth overhaul)
+    /// AND to sign SetMatcherConfig.
+    fn init_matcher_context(
+        &mut self,
+        maker_account: Pubkey,
+        maker_owner: &Keypair,
+    ) -> (Pubkey, Pubkey) {
+        let maker_owner_key = maker_owner.pubkey();
         let ctx = Pubkey::new_unique();
         let delegate = matcher_delegate_key(
             &self.program_id,
             &self.market,
             &maker_account,
+            &maker_owner_key,
             &self.matcher_program,
             &ctx,
         );
@@ -698,6 +712,27 @@ impl CrosscutEnv {
             &[],
         )
         .expect("init matcher context");
+        // v17: SetMatcherConfig registers the matcher context in the maker's portfolio.
+        // Required before TradeCpi: matcher_tail_start_or_verify_lp_config checks
+        // cfg.matcher_program / .matcher_context / .matcher_delegate.
+        send_ixs(
+            &mut self.svm,
+            &self.payer,
+            vec![Instruction {
+                program_id: self.program_id,
+                accounts: vec![
+                    AccountMeta::new(maker_owner_key, true),
+                    AccountMeta::new_readonly(self.market, false),
+                    AccountMeta::new(maker_account, false),
+                    AccountMeta::new_readonly(self.matcher_program, false),
+                    AccountMeta::new(ctx, false),
+                    AccountMeta::new_readonly(delegate, false),
+                ],
+                data: ProgInstruction::SetMatcherConfig { enabled: 1 }.encode(),
+            }],
+            &[maker_owner],
+        )
+        .expect("set matcher config on maker portfolio");
         (ctx, delegate)
     }
 
@@ -706,7 +741,8 @@ impl CrosscutEnv {
         &mut self,
         owner_a: &Keypair,
         account_a: Pubkey,
-        owner_b: &Keypair,
+        // v17: TradeCpi no longer requires signer_b — matcher-delegate auth replaces it.
+        _owner_b: &Keypair,
         account_b: Pubkey,
         ctx: Pubkey,
         delegate: Pubkey,
@@ -716,9 +752,10 @@ impl CrosscutEnv {
     ) -> Result<(), TransactionError> {
         let wix = Instruction {
             program_id: self.program_id,
+            // v17 account layout: [signer_a, market, account_a, account_b,
+            //                       matcher_prog(ro), matcher_ctx, matcher_delegate(ro)]
             accounts: vec![
                 AccountMeta::new(owner_a.pubkey(), true),
-                AccountMeta::new(owner_b.pubkey(), true),
                 AccountMeta::new(self.market, false),
                 AccountMeta::new(account_a, false),
                 AccountMeta::new(account_b, false),
@@ -734,7 +771,7 @@ impl CrosscutEnv {
             }
             .encode(),
         };
-        send_ixs(&mut self.svm, &self.payer, vec![wix], &[owner_a, owner_b])
+        send_ixs(&mut self.svm, &self.payer, vec![wix], &[owner_a])
     }
 
     fn account_data(&self, key: Pubkey) -> Vec<u8> {
@@ -922,7 +959,8 @@ impl CrosscutEnv {
                 AccountMeta::new_readonly(spl_token_classic_id(), false),
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
-            data: ProgInstruction::RequestRedeemLpShares { lp_amount }.encode(),
+            // v17: RequestRedeemLpShares field renamed lp_amount → shares.
+            data: ProgInstruction::RequestRedeemLpShares { shares: lp_amount }.encode(),
         };
         send_ixs(&mut self.svm, &self.payer, vec![wix], &[depositor]).expect("lp request redeem");
     }
@@ -1524,7 +1562,7 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
 
     // Matcher trade — opens positions; fee is internal (capital → insurance),
     // no collateral enters/leaves the vault.
-    let (ctx, delegate) = env.init_matcher_context(pb);
+    let (ctx, delegate) = env.init_matcher_context(pb, &owner_b);
     env.trade_cpi(&owner_a, pa, &owner_b, pb, ctx, delegate, CROSSCUT_ASSET, (10 * POS_SCALE) as i128, 100)
         .expect("matcher trade");
     // Executed guard: a REAL fill happened (so conservation isn't trivially met by a no-op).
@@ -2036,7 +2074,7 @@ fn x8_matcher_delegate_scoped_per_maker_rejects_mismatch() {
     env.deposit(&maker_y_owner, maker_y, 1_000_000);
 
     // Matcher context bound to maker Y (delegate PDA derived for Y).
-    let (ctx_y, delegate_y) = env.init_matcher_context(maker_y);
+    let (ctx_y, delegate_y) = env.init_matcher_context(maker_y, &maker_y_owner);
 
     // Y's delegate with maker X's accounts → delegate PDA mismatch.
     let res = env.trade_cpi(
@@ -2155,7 +2193,7 @@ fn x0_matcher_tradecpi_real_fill_at_mainnet() {
     env.deposit(&taker_owner, taker, 1_000_000);
     env.deposit(&maker_owner, maker, 1_000_000);
 
-    let (ctx, delegate) = env.init_matcher_context(maker);
+    let (ctx, delegate) = env.init_matcher_context(maker, &maker_owner);
     env.trade_cpi(
         &taker_owner,
         taker,
