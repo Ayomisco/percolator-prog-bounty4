@@ -1479,12 +1479,16 @@ fn kani_v16_every_active_payload_rejects_one_byte_truncation() {
 // Uses u8-range symbolic inputs (toly-style small-reference) for tractability.
 // Cross-ref: src/v16_program.rs handle_execute_redemption; lp_vault_design.md §5.2.
 
-// div_rem_u256 loop: for u8-range inputs wide_mul_div_floor_u128 always takes
-// the fast path (num.hi()==0 && den.hi()==0 → native u128 division, no loop).
-// unwind(1) is sound: the loop is unreachable for u8 inputs. Kani default is
-// also unwind(1) for unknown loops; this annotation makes the bound explicit.
+// Wide-math loop bounds for u8-range inputs:
+// - cmp_u512 / sub_u512 / shl_u512 / shr_u512: all `for i in 0..4` — exactly 4 iters.
+//   unwind(5) covers them (4 body executions + 1 exit-check).
+// - checked_div_rem_by_u256 `while i >= 0` division loop: for u8-range inputs
+//   U512 product has 0[2]==0 && 0[3]==0, so the fast path at line 1324 is always
+//   taken (→ div_rem_u256, no long loop). The while-loop is unreachable; unwind(5)
+//   is still sound (CBMC verifies the loop-entry condition fails on first check).
+// Summary: unwind(5) is tight and sound for all u8-range inputs.
 #[kani::proof]
-#[kani::unwind(1)]
+#[kani::unwind(5)]
 fn kani_lp_vault_redemption_split_conservation() {
     // Symbolic small-range inputs (u8 for tractability; the math is identical
     // at full u128 scale — wide_mul_div_floor_u128 is proven separately).
@@ -1583,11 +1587,11 @@ fn kani_lp_vault_redemption_split_conservation() {
 // Uses u8-range symbolic inputs for tractability.
 // Cross-ref: src/v16_program.rs handle_execute_redemption gross_consumed computation.
 
-// div_rem_u256 loop: same reasoning as above — for u8-range inputs all
-// arithmetic fits in u128, so the fast path (hi==0 → native u128 division) is
-// always taken and the binary-division loop is unreachable. unwind(1) is sound.
+// Loop bounds: same reasoning as kani_lp_vault_redemption_split_conservation above.
+// unwind(5) covers all fixed-size 4-iteration wide_math loops; the binary-division
+// while-loop is unreachable for u8-range inputs (fast path always taken).
 #[kani::proof]
-#[kani::unwind(1)]
+#[kani::unwind(5)]
 fn kani_lp_vault_redemption_fee_share_split_preserved() {
     // Symbolic small-range inputs.
     let net_earnings_u8: u8 = kani::any();
