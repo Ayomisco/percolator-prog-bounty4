@@ -12006,6 +12006,48 @@ pub mod processor {
             .checked_mul(BOUND_SCALE)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
 
+        // ECONOMICALLY-CORRECT gross earnings consumed by this redemption.
+        //
+        // Problem with the 89382f1 model (increments total_earnings_withdrawn_atoms
+        // by earnings_portion, the LP's fee_share slice): remaining lp_earnings for
+        // future LPs = floor((net - earnings_portion) * fee_share / 10_000) which
+        // does NOT drop by exactly earnings_portion. Over redemption cycles, future
+        // LPs can extract part of the insurance stub beyond their fee_share.
+        //
+        // Correct model: consumption of gross_consumed atoms from the earnings pool
+        // reduces lp_earnings by exactly earnings_portion:
+        //   floor((net - gross_consumed) * fee_share / 10_000)
+        //     = floor(net * fee_share / 10_000) - earnings_portion
+        //
+        // The gross chunk that maps to earnings_portion LP atoms via the fee_share split:
+        //   gross_consumed = ceil(earnings_portion * 10_000 / fee_share_bps)
+        //
+        // When fee_share_bps > 0: the ceiling ensures we don't under-subtract
+        // (remaining lp_earnings ≤ floor lp_earnings before, erring conservative).
+        // When earnings_portion == 0 (fee_share == 0 OR no earnings): gross_consumed = 0.
+        //
+        // What happens to the insurance stub atoms (gross_consumed - earnings_portion)?
+        // They stay in the vault — they were never paid out. We remove them from
+        // bucket.utilization_fee_earnings (that gross chunk is consumed), but the
+        // vault only decrements by earnings_portion (the LP payout). The difference
+        // remains in the vault as un-withdrawn insurance reserve.
+        let gross_consumed: u128 = if earnings_portion == 0 {
+            0
+        } else {
+            // fee_share_bps > 0 is guaranteed when earnings_portion > 0:
+            // lp_earnings = floor(net * fee_share / 10_000). If fee_share == 0
+            // then lp_earnings == 0, atoms == available_principal, earnings_portion == 0.
+            // So the branch above catches fee_share == 0 safely.
+            let result = percolator::wide_math::mul_div_ceil_u256(
+                percolator::wide_math::U256::from_u128(earnings_portion),
+                percolator::wide_math::U256::from_u128(percolator::MAX_MARGIN_BPS as u128),
+                percolator::wide_math::U256::from_u128(registry.fee_share_bps as u128),
+            );
+            result
+                .try_into_u128()
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?
+        };
+
         // ── Inline withdraw — MIRRORS handle_withdraw_backing_bucket. ──
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -12081,9 +12123,11 @@ pub mod processor {
                     .total_principal_atoms
                     .checked_sub(principal_portion)
                     .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                // Use gross_consumed (not earnings_portion) so nav_post reflects
+                // the correct remaining net_earnings for the fee_share split.
                 let post_earnings_withdrawn = ledger
                     .total_earnings_withdrawn_atoms
-                    .checked_add(earnings_portion)
+                    .checked_add(gross_consumed)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                 let nav_post_atoms = percolator::lp_vault::lp_vault_nav_atoms(
                     post_principal,
@@ -12122,25 +12166,34 @@ pub mod processor {
             }
             // ── Earnings-side bucket mutation (inline — bypasses vault decrement
             //    in withdraw_backing_provider_earnings_not_atomic since vault is
-            //    decremented once below by full `atoms`).
-            //    Mirrors the bucket accounting in withdraw_backing_provider_earnings_not_atomic
-            //    (v16.rs:6599-6619) WITHOUT calling the engine method (which would
-            //    double-decrement vault). We update:
-            //      bucket.utilization_fee_earnings      (same field the engine writes)
-            //      group.backing_provider_earnings_total (kept in sync via the delta)
-            //    The ledger's last_observed_bucket_earnings_atoms and
-            //    total_earnings_withdrawn_atoms are updated below.
-            if earnings_portion > 0 {
+            //    decremented once below by earnings_portion only).
+            //
+            // ECONOMICALLY-CORRECT earnings accounting (v17 supersedes 89382f1):
+            //
+            // We consume gross_consumed atoms from bucket.utilization_fee_earnings
+            // (the gross earnings pool). Of these, earnings_portion is paid to the LP
+            // (physically leaves the vault). The remaining insurance stub
+            // (gross_consumed - earnings_portion) stays IN the vault — the vault only
+            // decrements by earnings_portion below, keeping the insurance portion safe.
+            //
+            // This ensures remaining LPs' lp_earnings drops by exactly earnings_portion:
+            //   lp_earnings_after = floor((net - gross_consumed) * fee_share / 10_000)
+            //                     = lp_earnings_before - earnings_portion
+            //
+            // 89382f1 error: consumed only earnings_portion (LP slice) from gross pool,
+            // so remaining net_earnings was overstated and future LPs could extract the
+            // insurance stub via their NAV computation.
+            if gross_consumed > 0 {
                 bucket.utilization_fee_earnings = bucket
                     .utilization_fee_earnings
-                    .checked_sub(earnings_portion)
+                    .checked_sub(gross_consumed)
                     .ok_or(PercolatorError::EngineCounterUnderflow)?;
                 group.header.backing_provider_earnings_total = percolator::V16PodU128::new(
                     group
                         .header
                         .backing_provider_earnings_total
                         .get()
-                        .checked_sub(earnings_portion)
+                        .checked_sub(gross_consumed)
                         .ok_or(PercolatorError::EngineCounterUnderflow)?,
                 );
             }
@@ -12186,9 +12239,12 @@ pub mod processor {
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?,
             );
             // Vault decrements by full atoms (principal_portion + earnings_portion)
-            // in one operation. The principal-side fresh-unliened decrement above and
-            // the earnings-side backing_provider_earnings_total decrement above keep
-            // the validate_shape senior-<=vault invariant satisfied.
+            // in one operation (principal_portion + earnings_portion). The vault is NOT
+            // decremented by the insurance stub (gross_consumed - earnings_portion) —
+            // that amount remains in the vault as un-withdrawn insurance reserve.
+            // The principal-side fresh-unliened decrement above and the earnings-side
+            // backing_provider_earnings_total decrement (by gross_consumed) above keep
+            // validate_shape (senior + earnings <= vault) satisfied.
             group.header.vault = percolator::V16PodU128::new(
                 group
                     .header
@@ -12207,19 +12263,22 @@ pub mod processor {
                 .total_principal_withdrawn_atoms
                 .checked_add(principal_portion)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            // Earnings ledger: book earnings_portion GROSS (mirrors
-            // handle_withdraw_backing_bucket_earnings at v16_program.rs:8580-8583).
-            // last_observed_bucket_earnings_atoms tracks the snapshot of
-            // bucket.utilization_fee_earnings at last sync; we mirror the
-            // adjustment so the next sync does not double-count the withdrawal.
-            if earnings_portion > 0 {
+            // Earnings ledger: book gross_consumed to total_earnings_withdrawn_atoms.
+            // This is the GROSS consumed from the earnings pool for this redemption.
+            // The fee_share split is preserved: floor((total_earnings - withdrawn_after) *
+            // fee_share / 10_000) drops by exactly earnings_portion for remaining LPs.
+            //
+            // last_observed_bucket_earnings_atoms is a snapshot of
+            // bucket.utilization_fee_earnings; we subtract gross_consumed so the next
+            // sync_backing_domain_ledger call does not re-credit the consumed chunk.
+            if gross_consumed > 0 {
                 ledger.last_observed_bucket_earnings_atoms = ledger
                     .last_observed_bucket_earnings_atoms
-                    .checked_sub(earnings_portion)
+                    .checked_sub(gross_consumed)
                     .ok_or(PercolatorError::EngineCounterUnderflow)?;
                 ledger.total_earnings_withdrawn_atoms = ledger
                     .total_earnings_withdrawn_atoms
-                    .checked_add(earnings_portion)
+                    .checked_add(gross_consumed)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             }
             group.validate_shape().map_err(map_v16_error)?;
