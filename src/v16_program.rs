@@ -12165,6 +12165,18 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             *source_acc = percolator::SourceCreditStateV16Account::from_runtime(&source);
             *bucket_acc = percolator::BackingBucketV16Account::from_runtime(&bucket);
+            // STEP-6 (v17): maintain source_fresh_backing_total_num aggregate.
+            // source.fresh_reserved_backing_num dropped by backing_num above;
+            // the header aggregate must mirror that delta or validate_header_aggregate_totals
+            // (senior + fresh_backing/BOUND_SCALE <= vault) rejects every ExecuteRedemption.
+            group.header.source_fresh_backing_total_num = percolator::V16PodU128::new(
+                group
+                    .header
+                    .source_fresh_backing_total_num
+                    .get()
+                    .checked_sub(backing_num)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?,
+            );
             group.header.risk_epoch = percolator::V16PodU64::new(
                 group
                     .header
