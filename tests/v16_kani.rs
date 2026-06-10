@@ -1435,3 +1435,92 @@ fn kani_v16_every_active_payload_rejects_one_byte_truncation() {
     let force_close = [64u8; 26];
     assert!(Instruction::decode(&force_close).is_err());
 }
+
+// ── LP Vault redemption split conservation proofs ────────────────────────────
+//
+// Proves the core invariant of the v17 principal/earnings split fix:
+// atoms = principal_portion + earnings_portion  (conservation)
+// principal_portion <= available_principal       (no over-draw on principal pool)
+// earnings_portion  <= lp_earnings               (no over-draw on LP earnings)
+//
+// Uses u8-range symbolic inputs (toly-style small-reference) for tractability.
+// Cross-ref: src/v16_program.rs handle_execute_redemption; lp_vault_design.md §5.2.
+
+#[kani::proof]
+fn kani_lp_vault_redemption_split_conservation() {
+    // Symbolic small-range inputs (u8 for tractability; the math is identical
+    // at full u128 scale — wide_mul_div_floor_u128 is proven separately).
+    let total_principal_u8: u8 = kani::any();
+    let net_earnings_u8: u8 = kani::any();
+    let fee_share_bps_u8: u8 = kani::any();
+    let shares_u8: u8 = kani::any();
+    let total_shares_u8: u8 = kani::any();
+
+    // Scale up to u128 for the math.
+    let total_principal = total_principal_u8 as u128;
+    let net_earnings = net_earnings_u8 as u128;
+    let fee_share_bps = fee_share_bps_u8 as u128;
+    let shares = shares_u8 as u128;
+    let total_shares = total_shares_u8 as u128;
+
+    // Preconditions (mirrors handle_execute_redemption guards).
+    kani::assume(total_shares > 0);
+    kani::assume(shares <= total_shares);
+    kani::assume(fee_share_bps <= 10_000u128);
+    // No impairment (net_impairment = 0) for this proof.
+    let available_principal = total_principal;
+
+    // Compute lp_earnings = floor(net_earnings * fee_share_bps / 10_000).
+    let lp_earnings = percolator::wide_math::wide_mul_div_floor_u128(
+        net_earnings, fee_share_bps, 10_000,
+    );
+    // NAV = available_principal + lp_earnings.
+    let nav = available_principal
+        .checked_add(lp_earnings)
+        .expect("nav fits");
+
+    // atoms = floor(shares * nav / total_shares).
+    let atoms = percolator::wide_math::wide_mul_div_floor_u128(shares, nav, total_shares);
+
+    // principal_portion = floor(shares * available_principal / total_shares).
+    let principal_portion = percolator::wide_math::wide_mul_div_floor_u128(
+        shares, available_principal, total_shares,
+    );
+    // earnings_portion = atoms - principal_portion.
+    // This must not underflow (proven below).
+    assert!(
+        atoms >= principal_portion,
+        "atoms >= principal_portion (earnings_portion is non-negative)"
+    );
+    let earnings_portion = atoms - principal_portion;
+
+    // CONSERVATION 1: split sums to atoms exactly.
+    assert_eq!(
+        principal_portion + earnings_portion,
+        atoms,
+        "principal_portion + earnings_portion == atoms"
+    );
+
+    // CONSERVATION 2: principal_portion never exceeds available principal pool.
+    assert!(
+        principal_portion <= available_principal,
+        "no over-draw on principal pool"
+    );
+
+    // CONSERVATION 3: earnings_portion never exceeds lp_earnings.
+    // LP earns floor(shares/total_shares * lp_earnings) which rounds down;
+    // the difference (insurance stub) stays in the bucket.
+    assert!(
+        earnings_portion <= lp_earnings,
+        "no over-draw on lp_earnings; insurance stub preserved"
+    );
+
+    // CONSERVATION 4: guard invariant — principal_portion <= total_principal_atoms.
+    // This is WHY the old guard `atoms > total_principal_atoms` was wrong:
+    // atoms can exceed total_principal (when earnings present), but principal_portion
+    // never can (principal_portion <= available_principal <= total_principal_atoms).
+    assert!(
+        principal_portion <= total_principal,
+        "guard invariant: principal_portion always <= total_principal_atoms"
+    );
+}

@@ -11923,7 +11923,20 @@ pub mod processor {
         verify_vault_token_account(vault_token, &vault_authority, &mint)?;
 
         // ── NAV (pre-withdraw) → atoms (round DOWN). ──
-        let atoms = {
+        //
+        // SPLIT: atoms = principal_portion + earnings_portion.
+        //   principal_portion = floor(shares * available_principal / total_shares)
+        //   earnings_portion  = atoms - principal_portion
+        //
+        // Only principal_portion is routed through the fresh-unliened backing
+        // path (bucket.fresh_unliened_backing_num decrement). earnings_portion
+        // is routed through withdraw_backing_provider_earnings_not_atomic and
+        // booked to total_earnings_withdrawn_atoms (GROSS convention, mirroring
+        // handle_withdraw_backing_bucket_earnings at v16_program.rs:8580-8583).
+        // The insurance-side stub ((1-fee_share) of gross net_earnings) stays
+        // in the bucket — it was never counted in LP NAV and no token moves for
+        // it. This is the only correct split; see lp_vault_design.md §5.2 Note 3.
+        let (atoms, principal_portion, earnings_portion) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (_, group) = state::market_view_mut(&mut market_data)?;
             let (_, bucket) = backing_domain_parts_view(&group, domain)?;
@@ -11936,6 +11949,15 @@ pub mod processor {
                 &bucket,
             )?;
             sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            // available_principal mirrors lp_vault_nav_atoms internals exactly.
+            let net_impairment = ledger
+                .cumulative_loss_atoms
+                .checked_sub(ledger.cumulative_recovery_atoms)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            let available_principal = ledger
+                .total_principal_atoms
+                .checked_sub(net_impairment)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
             let nav = percolator::lp_vault::lp_vault_nav_atoms(
                 ledger.total_principal_atoms,
                 ledger.total_earnings_atoms,
@@ -11945,12 +11967,24 @@ pub mod processor {
                 registry.fee_share_bps,
             )
             .map_err(map_v16_error)?;
-            percolator::lp_vault::lp_atoms_for_redemption(
+            let atoms_out = percolator::lp_vault::lp_atoms_for_redemption(
                 redemption.shares,
                 registry.total_lp_shares_outstanding,
                 nav,
             )
-            .map_err(map_v16_error)?
+            .map_err(map_v16_error)?;
+            // principal_portion = floor(shares * available_principal / total_shares).
+            // Rounds down — consistent with lp_atoms_for_redemption. Never exceeds atoms_out
+            // because available_principal <= nav.
+            let principal_out = percolator::wide_math::wide_mul_div_floor_u128(
+                redemption.shares,
+                available_principal,
+                registry.total_lp_shares_outstanding,
+            );
+            let earnings_out = atoms_out
+                .checked_sub(principal_out)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            (atoms_out, principal_out, earnings_out)
         };
         // Dust-share redemption rounding to 0 atoms would burn shares for no
         // payout — reject.
@@ -11958,7 +11992,9 @@ pub mod processor {
             return Err(PercolatorError::LpVaultZeroAmount.into());
         }
         let atoms_u64 = amount_to_u64(atoms)?;
-        let backing_num = atoms
+        // backing_num is derived from principal_portion only (the fresh-unliened
+        // backing path handles principal, not earnings).
+        let backing_num = principal_portion
             .checked_mul(BOUND_SCALE)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
 
@@ -12001,10 +12037,14 @@ pub mod processor {
                 &bucket,
             )?;
             sync_backing_domain_ledger(&mut ledger, &bucket)?;
-            if atoms > ledger.total_principal_atoms {
+            // Liveness guard: principal_portion must not exceed available principal.
+            // (Pre-split bug: this compared `atoms` which includes earnings — could
+            // incorrectly block redemptions once earnings make NAV > total_principal.)
+            if principal_portion > ledger.total_principal_atoms {
                 return Err(PercolatorError::EngineCounterUnderflow.into());
             }
             // Same withdrawability gate as handle_withdraw_backing_bucket.
+            // backing_num is derived from principal_portion; vault check uses full atoms.
             if source.positive_claim_bound_num != 0
                 || source.exact_positive_claim_num != 0
                 || bucket.status != BackingBucketStatusV16::Fresh
@@ -12014,8 +12054,13 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // Earnings availability gate: earnings pool must cover the LP's earnings slice.
+            if earnings_portion > bucket.utilization_fee_earnings {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
             // OI reservation guard: leave nav_post * threshold/10_000 of
-            // outstanding backing covered.
+            // outstanding backing covered. nav_post is computed from the full
+            // post-redeem NAV (available_principal_post + lp_earnings_post).
             if registry.oi_reservation_threshold_bps != 0 {
                 let outstanding_post = bucket
                     .fresh_unliened_backing_num
@@ -12023,13 +12068,28 @@ pub mod processor {
                     .ok_or(PercolatorError::EngineCounterUnderflow)?
                     .checked_add(bucket.valid_liened_backing_num)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                let nav_post = ledger
+                // Post-redeem NAV: recompute with post-withdrawal counters.
+                let post_principal = ledger
                     .total_principal_atoms
-                    .checked_sub(atoms)
-                    .ok_or(PercolatorError::EngineCounterUnderflow)?
+                    .checked_sub(principal_portion)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                let post_earnings_withdrawn = ledger
+                    .total_earnings_withdrawn_atoms
+                    .checked_add(earnings_portion)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                let nav_post_atoms = percolator::lp_vault::lp_vault_nav_atoms(
+                    post_principal,
+                    ledger.total_earnings_atoms,
+                    post_earnings_withdrawn,
+                    ledger.cumulative_loss_atoms,
+                    ledger.cumulative_recovery_atoms,
+                    registry.fee_share_bps,
+                )
+                .map_err(map_v16_error)?;
+                let nav_post_num = nav_post_atoms
                     .checked_mul(BOUND_SCALE)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                let covered = nav_post
+                let covered = nav_post_num
                     .checked_mul(registry.oi_reservation_threshold_bps as u128)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?
                     / 10_000u128;
@@ -12037,6 +12097,7 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultOiReservationViolated.into());
                 }
             }
+            // ── Principal-side bucket mutation. ──
             bucket.fresh_unliened_backing_num = bucket
                 .fresh_unliened_backing_num
                 .checked_sub(backing_num)
@@ -12050,6 +12111,30 @@ pub mod processor {
                     bucket.status = BackingBucketStatusV16::Empty;
                     bucket.expiry_slot = 0;
                 }
+            }
+            // ── Earnings-side bucket mutation (inline — bypasses vault decrement
+            //    in withdraw_backing_provider_earnings_not_atomic since vault is
+            //    decremented once below by full `atoms`).
+            //    Mirrors the bucket accounting in withdraw_backing_provider_earnings_not_atomic
+            //    (v16.rs:6599-6619) WITHOUT calling the engine method (which would
+            //    double-decrement vault). We update:
+            //      bucket.utilization_fee_earnings      (same field the engine writes)
+            //      group.backing_provider_earnings_total (kept in sync via the delta)
+            //    The ledger's last_observed_bucket_earnings_atoms and
+            //    total_earnings_withdrawn_atoms are updated below.
+            if earnings_portion > 0 {
+                bucket.utilization_fee_earnings = bucket
+                    .utilization_fee_earnings
+                    .checked_sub(earnings_portion)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                group.header.backing_provider_earnings_total = percolator::V16PodU128::new(
+                    group
+                        .header
+                        .backing_provider_earnings_total
+                        .get()
+                        .checked_sub(earnings_portion)
+                        .ok_or(PercolatorError::EngineCounterUnderflow)?,
+                );
             }
             // RESYNC 5ebd136 DUAL withdraw-gate: mirror the source-credit watermark
             // gate from handle_withdraw_backing_bucket. Without it, LP-vault redeem
@@ -12080,6 +12165,10 @@ pub mod processor {
                     .checked_add(1)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?,
             );
+            // Vault decrements by full atoms (principal_portion + earnings_portion)
+            // in one operation. The principal-side fresh-unliened decrement above and
+            // the earnings-side backing_provider_earnings_total decrement above keep
+            // the validate_shape senior-<=vault invariant satisfied.
             group.header.vault = percolator::V16PodU128::new(
                 group
                     .header
@@ -12088,14 +12177,31 @@ pub mod processor {
                     .checked_sub(atoms)
                     .ok_or(PercolatorError::EngineCounterUnderflow)?,
             );
+            // ── Ledger updates. ──
+            // Principal ledger: only principal_portion (NOT earnings_portion).
             ledger.total_principal_atoms = ledger
                 .total_principal_atoms
-                .checked_sub(atoms)
+                .checked_sub(principal_portion)
                 .ok_or(PercolatorError::EngineCounterUnderflow)?;
             ledger.total_principal_withdrawn_atoms = ledger
                 .total_principal_withdrawn_atoms
-                .checked_add(atoms)
+                .checked_add(principal_portion)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            // Earnings ledger: book earnings_portion GROSS (mirrors
+            // handle_withdraw_backing_bucket_earnings at v16_program.rs:8580-8583).
+            // last_observed_bucket_earnings_atoms tracks the snapshot of
+            // bucket.utilization_fee_earnings at last sync; we mirror the
+            // adjustment so the next sync does not double-count the withdrawal.
+            if earnings_portion > 0 {
+                ledger.last_observed_bucket_earnings_atoms = ledger
+                    .last_observed_bucket_earnings_atoms
+                    .checked_sub(earnings_portion)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                ledger.total_earnings_withdrawn_atoms = ledger
+                    .total_earnings_withdrawn_atoms
+                    .checked_add(earnings_portion)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            }
             group.validate_shape().map_err(map_v16_error)?;
             write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
         }
