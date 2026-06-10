@@ -1557,3 +1557,118 @@ fn kani_lp_vault_redemption_split_conservation() {
         "guard invariant: principal_portion always <= total_principal_atoms"
     );
 }
+
+// ── LP Vault fee_share split preservation across redemptions ─────────────────
+//
+// Proves the ECONOMICALLY-CORRECT gross_consumed model (v17 Step-3 fix):
+//
+//   gross_consumed = ceil(earnings_portion * 10_000 / fee_share_bps)
+//
+// After the redemption, remaining LPs' lp_earnings drops by EXACTLY earnings_portion:
+//
+//   lp_earnings_after = floor((net - gross_consumed) * fee_share / 10_000)
+//                     = lp_earnings_before - earnings_portion
+//
+// This certifies the fee_share split is preserved — the insurance stub
+// (gross_consumed - earnings_portion) is NOT accessible to future LP redemptions.
+//
+// RED CONTROL: if gross_consumed = earnings_portion (the 89382f1 bug), the proof
+// FAILS whenever fee_share_bps < 10_000 and earnings_portion > 0 (the split breaks).
+//
+// Uses u8-range symbolic inputs for tractability.
+// Cross-ref: src/v16_program.rs handle_execute_redemption gross_consumed computation.
+
+#[kani::proof]
+fn kani_lp_vault_redemption_fee_share_split_preserved() {
+    // Symbolic small-range inputs.
+    let net_earnings_u8: u8 = kani::any();
+    let fee_share_bps_u8: u8 = kani::any();
+    let shares_u8: u8 = kani::any();
+    let total_shares_u8: u8 = kani::any();
+    let total_principal_u8: u8 = kani::any();
+
+    let net_earnings = net_earnings_u8 as u128;
+    let fee_share_bps = fee_share_bps_u8 as u128;
+    let shares = shares_u8 as u128;
+    let total_shares = total_shares_u8 as u128;
+    let available_principal = total_principal_u8 as u128;
+
+    // Preconditions.
+    kani::assume(total_shares > 0);
+    kani::assume(shares <= total_shares);
+    kani::assume(fee_share_bps <= 10_000u128);
+
+    // lp_earnings_before = floor(net * fee_share / 10_000).
+    let lp_earnings_before =
+        percolator::wide_math::wide_mul_div_floor_u128(net_earnings, fee_share_bps, 10_000);
+
+    // NAV and atoms.
+    let nav = available_principal
+        .checked_add(lp_earnings_before)
+        .expect("nav fits u128");
+    let atoms = percolator::wide_math::wide_mul_div_floor_u128(shares, nav, total_shares);
+    let principal_portion =
+        percolator::wide_math::wide_mul_div_floor_u128(shares, available_principal, total_shares);
+    assert!(atoms >= principal_portion, "no underflow on earnings_portion");
+    let earnings_portion = atoms - principal_portion;
+
+    // gross_consumed = ceil(earnings_portion * 10_000 / fee_share_bps).
+    // When earnings_portion == 0 (including fee_share_bps == 0), gross_consumed = 0.
+    let gross_consumed: u128 = if earnings_portion == 0 {
+        0
+    } else {
+        // fee_share_bps > 0 is guaranteed when earnings_portion > 0 (see src comment).
+        let result = percolator::wide_math::mul_div_ceil_u256(
+            percolator::wide_math::U256::from_u128(earnings_portion),
+            percolator::wide_math::U256::from_u128(10_000u128),
+            percolator::wide_math::U256::from_u128(fee_share_bps),
+        );
+        result.try_into_u128().expect("gross_consumed fits u128")
+    };
+
+    // SPLIT PRESERVATION: remaining lp_earnings after gross_consumed consumed.
+    //
+    // Precondition: gross_consumed <= net_earnings (the gross chunk must fit).
+    // This is provably true: gross_consumed = ceil(ep * 10_000 / fee_share)
+    // <= ceil(lp_earnings * 10_000 / fee_share) <= ceil(net_earnings * fee_share / 10_000
+    //    * 10_000 / fee_share) = ceil(net_earnings) = net_earnings (integer).
+    // We assert it as a correctness check.
+    assert!(
+        gross_consumed <= net_earnings,
+        "gross_consumed never exceeds net_earnings"
+    );
+
+    let net_after = net_earnings - gross_consumed;
+    let lp_earnings_after =
+        percolator::wide_math::wide_mul_div_floor_u128(net_after, fee_share_bps, 10_000);
+
+    // CONSERVATION 5 (fee_share split preserved):
+    // lp_earnings drops by exactly earnings_portion after the redemption.
+    assert_eq!(
+        lp_earnings_before,
+        lp_earnings_after
+            .checked_add(earnings_portion)
+            .expect("no overflow"),
+        "fee_share split preserved: lp_earnings_after + earnings_portion == lp_earnings_before"
+    );
+
+    // CONSERVATION 6 (insurance stub in vault):
+    // The insurance stub (gross_consumed - earnings_portion) stays in vault.
+    let insurance_stub = gross_consumed - earnings_portion;
+    // Insurance stub is always non-negative (gross_consumed >= earnings_portion).
+    // Proof: gross_consumed = ceil(ep * 10_000 / fee_share) >= ep * 10_000 / fee_share
+    //        >= ep (since fee_share <= 10_000). And gross_consumed = ep when fee_share == 10_000.
+    assert!(
+        gross_consumed >= earnings_portion,
+        "insurance stub is non-negative (gross_consumed >= earnings_portion)"
+    );
+    // When fee_share == 10_000, the insurance stub is 0 (LP gets everything).
+    if fee_share_bps == 10_000 {
+        assert_eq!(insurance_stub, 0, "full fee_share: no insurance stub");
+    }
+    // When fee_share == 0, no earnings go to LP.
+    if fee_share_bps == 0 {
+        assert_eq!(earnings_portion, 0, "zero fee_share: LP gets no earnings");
+        assert_eq!(gross_consumed, 0, "zero fee_share: no gross consumed");
+    }
+}
