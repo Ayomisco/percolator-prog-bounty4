@@ -600,25 +600,25 @@ fn execute_redemption_rejects_noncanonical_vault() {
 //   principal_A = floor(1_000_000 * 3_000_000 / 3_000_000) = 1_000_000
 //   earnings_A  = 1_066_666 - 1_000_000 = 66_666
 //
-// After LP A redeems, remaining: principal=2_000_000, earnings_withdrawn=66_666
-//   net_earnings_remaining = 400_000 - 66_666 = 333_334
-//   lp_earnings_remaining  = floor(333_334 * 5_000 / 10_000) = 166_667
+// After LP A redeems (gross_consumed model):
+//   gross_consumed_A = ceil(66_666 * 10_000 / 5_000) = 133_332
+//   net_earnings_remaining = 400_000 - 133_332 = 266_668
+//   lp_earnings_remaining  = floor(266_668 * 5_000 / 10_000) = 133_334
 //   available_principal    = 2_000_000
-//   nav_remaining          = 2_166_667
+//   nav_remaining          = 2_133_334
 //   total_shares_remaining = 2_000_000
 //
-// LP B holds all remaining shares (2_000_000):
-//   atoms_B = floor(2_000_000 * 2_166_667 / 2_000_000) = 2_166_667
-//   principal_B = floor(2_000_000 * 2_000_000 / 2_000_000) = 2_000_000
-//   earnings_B  = 2_166_667 - 2_000_000 = 166_667
+// LP B holds all remaining shares (2_000_000) — GROSS_CONSUMED model:
+//   atoms_B = floor(2_000_000 * 2_133_334 / 2_000_000) = 2_133_334
+//   principal_B = 2_000_000, earnings_B = 133_334
+//   gross_consumed_B = ceil(133_334 * 10_000 / 5_000) = 266_668
 //
-// Total paid out = 1_066_666 + 2_166_667 = 3_233_333
+// Total paid out = 1_066_666 + 2_133_334 = 3_200_000
 // Vault seeded  = 3_000_000 (deposits) + 400_000 (earnings) = 3_400_000
-// Insurance stub = 200_000 - 66_666 - 166_667 = (rounding residual stays in vault)
-// Remaining vault = 3_400_000 - 3_233_333 = 166_667  (the insurance stub + rounding dust)
+// Insurance stub = 3_400_000 - 3_200_000 = 200_000 = 50% of 400_000 EXACTLY
 //
-// The insurance stub is NEVER extracted by LP redemptions — it stays in the vault
-// as a protocol reserve (lp_vault_design.md §5.2 Note 3).
+// Fee_share split PRESERVED: LP total = 200_000 (50%), insurance = 200_000 (50%).
+// (89382f1 model gave only 166_667 stub — 33_333 leaked to LPs beyond fee_share.)
 
 /// Seeds bucket earnings by directly writing the market account — same pattern
 /// as v16_fork_lp_vault_admin.rs:seed_bucket_earnings. Both `group.vault` (the
@@ -663,6 +663,35 @@ fn vault_balance(env: &Env) -> u64 {
 /// CONSERVATION TEST: deposit → seed_earnings → partial redeem (LP A) → full
 /// redeem (LP B).  Asserts exact principal+earnings split, ledger counters,
 /// remaining vault (insurance stub), and no-double-redeem.
+/// SUPERSEDES 89382f1 conservation test — uses the corrected gross_consumed model.
+///
+/// SETUP: fee_share_bps = 5_000 (50% LP, 50% insurance).
+///   Two depositors: LP A (1_000_000), LP B (2_000_000).
+///   Total principal = 3_000_000. Gross earnings seeded = 400_000.
+///   lp_earnings_total = floor(400_000 * 5_000 / 10_000) = 200_000.
+///   NAV_total = 3_200_000.
+///
+/// LP A REDEEM (1_000_000 / 3_000_000 shares):
+///   atoms_A = floor(1_000_000 * 3_200_000 / 3_000_000) = 1_066_666
+///   principal_A = floor(1_000_000 * 3_000_000 / 3_000_000) = 1_000_000
+///   earnings_A = 66_666
+///   gross_consumed_A = ceil(66_666 * 10_000 / 5_000) = ceil(133_332) = 133_332
+///   → net_earnings_remaining = 400_000 - 133_332 = 266_668
+///   → lp_earnings_remaining  = floor(266_668 * 5_000/10_000) = 133_334
+///
+/// LP B REDEEM (2_000_000 / 2_000_000 shares):
+///   NAV_B = 2_000_000 + 133_334 = 2_133_334
+///   atoms_B = floor(2_000_000 * 2_133_334 / 2_000_000) = 2_133_334
+///   principal_B = 2_000_000, earnings_B = 133_334
+///   gross_consumed_B = ceil(133_334 * 10_000 / 5_000) = ceil(266_668) = 266_668
+///
+/// CONSERVATION:
+///   total_payout = 1_066_666 + 2_133_334 = 3_200_000
+///   insurance_stub = 3_400_000 - 3_200_000 = 200_000 = 50% of 400_000 EXACTLY
+///   (89382f1 bug: stub was only 166_667, short by 33_333 due to fee_share leak)
+///
+/// FEE_SHARE SPLIT PRESERVED: LP total = 200_000 = 50% of gross earnings ✓
+///                             insurance stub = 200_000 = 50% ✓
 #[test]
 fn conservation_with_earnings_partial_then_full_redeem() {
     let mut env = setup_vault(0); // fee_share_bps = 5_000, immediate cooldown
@@ -683,20 +712,28 @@ fn conservation_with_earnings_partial_then_full_redeem() {
     execute(&mut env, &d_a).expect("A execute");
 
     let payout_a = tok(&env.svm, d_a.dest) as u128;
-    // Expected: floor(1_000_000 * 3_200_000 / 3_000_000) = 1_066_666
+    // atoms_A = floor(1_000_000 * 3_200_000 / 3_000_000) = 1_066_666
     assert_eq!(payout_a, 1_066_666, "LP A payout = principal + earnings slice");
 
-    // Ledger after A: principal decremented by principal_A = 1_000_000
-    //                 earnings_withdrawn incremented by earnings_A = 66_666
+    // Ledger after A (gross_consumed model):
+    //   principal decremented by 1_000_000
+    //   total_earnings_withdrawn_atoms += gross_consumed_A = 133_332
+    //     (NOT 66_666 as in 89382f1 — the gross chunk is consumed, insurance stub stays)
     let led_a = ledger(&env);
     assert_eq!(led_a.total_principal_atoms, 2_000_000, "principal remaining after A");
     assert_eq!(led_a.total_principal_withdrawn_atoms, 1_000_000, "principal withdrawn after A");
-    assert_eq!(led_a.total_earnings_withdrawn_atoms, 66_666, "earnings withdrawn after A");
-    // total_earnings_atoms must equal 400_000 (sync'd from bucket seed).
+    assert_eq!(
+        led_a.total_earnings_withdrawn_atoms, 133_332,
+        "earnings_withdrawn = gross_consumed_A (133_332), not LP slice (66_666)"
+    );
     assert_eq!(led_a.total_earnings_atoms, 400_000, "total_earnings_atoms unchanged by redemption");
 
     // Remaining shares: 2_000_000 (all held by LP B).
     assert_eq!(reg(&env).total_lp_shares_outstanding, 2_000_000, "shares after A redeems");
+
+    // Vault after A: 3_400_000 - 1_066_666 = 2_333_334
+    // Insurance stub for A's chunk: 133_332 - 66_666 = 66_666 atoms still in vault.
+    assert_eq!(vault_balance(&env), 2_333_334, "vault balance after A redeems");
 
     // ── LP B redeems all 2_000_000 shares. ──
     request(&mut env, &d_b, 2_000_000).expect("B request");
@@ -704,40 +741,45 @@ fn conservation_with_earnings_partial_then_full_redeem() {
     execute(&mut env, &d_b).expect("B execute");
 
     let payout_b = tok(&env.svm, d_b.dest) as u128;
-    // Expected: floor(2_000_000 * 2_166_667 / 2_000_000) = 2_166_667
-    // (net_earnings_remaining = 333_334, lp_earnings_remaining = floor(333_334/2) = 166_667)
-    assert_eq!(payout_b, 2_166_667, "LP B payout = principal + earnings slice");
+    // net_earnings_remaining = 400_000 - 133_332 = 266_668
+    // lp_earnings_B = floor(266_668 * 5_000 / 10_000) = floor(133_334) = 133_334
+    // NAV_B = 2_000_000 + 133_334 = 2_133_334
+    // atoms_B = floor(2_000_000 * 2_133_334 / 2_000_000) = 2_133_334
+    assert_eq!(payout_b, 2_133_334, "LP B payout (fee_share split preserved — not inflated by A's stub)");
 
-    // Ledger after B: principal zero'd, earnings_withdrawn = 66_666 + 166_667 = 233_333
+    // Ledger after B.
     let led_b = ledger(&env);
     assert_eq!(led_b.total_principal_atoms, 0, "principal zero after B");
     assert_eq!(led_b.total_principal_withdrawn_atoms, 3_000_000, "total principal withdrawn");
-    assert_eq!(led_b.total_earnings_withdrawn_atoms, 233_333, "total earnings withdrawn after B");
+    // gross_consumed_B = ceil(133_334 * 10_000 / 5_000) = 266_668
+    // total_earnings_withdrawn_atoms = 133_332 + 266_668 = 400_000
+    assert_eq!(
+        led_b.total_earnings_withdrawn_atoms, 400_000,
+        "total earnings withdrawn = full gross (133_332 + 266_668)"
+    );
 
     // Outstanding shares zero.
     assert_eq!(reg(&env).total_lp_shares_outstanding, 0, "all shares redeemed");
 
-    // ── Conservation: vault remainder = insurance stub + rounding dust. ──
-    // Total paid = 1_066_666 + 2_166_667 = 3_233_333
+    // ── Conservation: vault remainder = insurance stub = exactly 50% of gross earnings. ──
+    // Total paid = 1_066_666 + 2_133_334 = 3_200_000
     // Total seeded = 3_400_000
-    // Remainder = 166_667 = insurance stub (never LP-accessible)
+    // Insurance stub = 200_000 = 50% of 400_000 = fee_share preserved exactly.
     let total_payout = payout_a + payout_b;
-    assert_eq!(total_payout, 3_233_333, "total payout");
+    assert_eq!(total_payout, 3_200_000, "total payout = principal + 50% of earnings");
     let remainder = vault_balance(&env) as u128;
-    assert_eq!(remainder, 3_400_000 - total_payout, "vault remainder = insurance stub");
-    // The insurance stub is POSITIVE (no fund loss to LPs; no over-payment).
-    assert!(remainder > 0, "insurance stub stays in vault (not extracted by LP redemptions)");
+    assert_eq!(remainder, 200_000, "vault remainder = insurance stub (50% of earnings)");
+    assert_eq!(remainder, 3_400_000 - total_payout, "vault remainder = seeded - paid");
+
+    // CRITICAL: insurance stub equals exactly (1 - fee_share) * gross_earnings.
+    // 89382f1 model gave only 166_667 here (stub shrank by 33_333 due to fee_share leak).
+    // Correct model: 50% * 400_000 = 200_000. ✓
+    assert_eq!(remainder, 200_000, "fee_share split preserved: insurance stub = 50% of gross earnings");
 
     // ── Double-redeem guard still holds after split. ──
     env.svm.expire_blockhash();
     assert!(execute(&mut env, &d_a).is_err(), "double-redeem A must reject");
     assert!(execute(&mut env, &d_b).is_err(), "double-redeem B must reject");
-
-    // ── NAV-per-share invariant: remaining LPs are not harmed by prior redemption. ──
-    // LP B received exactly their fair NAV share (2_166_667) — not inflated by A's
-    // insurance stub mis-booking (pre-fix: A would take 1_066_666 from principal only,
-    // leaving earnings double-counted for B; or block altogether on the guard).
-    assert_eq!(payout_b, 2_166_667, "B not harmed by A's redemption (NAV-per-share invariant)");
 }
 
 /// RED CONTROL: verifies that the liveness guard no longer blocks redemption
@@ -773,12 +815,16 @@ fn liveness_not_blocked_when_earnings_exceed_principal() {
 
     // LP receives exactly NAV: 250_000
     assert_eq!(tok(&env.svm, d.dest), 250_000, "LP paid full NAV (principal + earnings)");
-    // Vault remainder = insurance stub = 300_000 - 150_000 = 150_000
+    // Vault remainder = insurance stub = 300_000 (gross) - 150_000 (LP payout) = 150_000
     assert_eq!(vault_balance(&env), 150_000, "insurance stub stays in vault");
-    // Ledger is clean.
+    // Ledger: gross_consumed = ceil(150_000 * 10_000 / 5_000) = 300_000
+    // total_earnings_withdrawn_atoms = 300_000 (full gross chunk consumed).
     let led = ledger(&env);
     assert_eq!(led.total_principal_atoms, 0, "principal zero");
-    assert_eq!(led.total_earnings_withdrawn_atoms, 150_000, "earnings withdrawn = LP earnings slice");
+    assert_eq!(
+        led.total_earnings_withdrawn_atoms, 300_000,
+        "earnings_withdrawn = gross_consumed (300_000), not LP slice (150_000)"
+    );
     assert_eq!(reg(&env).total_lp_shares_outstanding, 0, "shares zero");
 }
 
