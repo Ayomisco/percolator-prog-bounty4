@@ -6812,8 +6812,13 @@ fn v16_bpf_close_resolved_pays_positive_pnl_through_engine_ledger() {
     assert_eq!(group.c_tot, 0);
     assert_eq!(account.capital, 0);
     assert_eq!(account.pnl, 0);
-    assert!(account.resolved_payout_receipt.present);
-    assert!(account.resolved_payout_receipt.finalized);
+    // v17 (BPF, against the real .so): source-backed positive PnL is realized
+    // directly into capital and paid in one shot (dest==1_250, vault==0 above) — it
+    // does NOT flow through the resolved payout receipt/ledger. Correct post-condition
+    // is a clean teardown with NO dangling receipt. (Matches the LiteSVM twin in
+    // v16_wrapper.rs::v16_wrapper_close_resolved_pays_positive_pnl_through_engine_ledger.)
+    assert!(!account.resolved_payout_receipt.present,
+        "source-backed positive PnL pays directly; no resolved_payout_receipt should remain");
 }
 
 #[test]
