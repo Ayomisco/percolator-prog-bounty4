@@ -16136,7 +16136,12 @@ pub mod processor {
                 return Err(ProgramError::InvalidAccountData);
             }
 
-            // M-1: Verify vault is owned by SPL Token program.
+            // Verify a_vault.key matches config.vault_pubkey — prevents
+            // vault substitution with an arbitrary SPL account.
+            let config = state::read_config(&slab_data);
+            accounts::expect_key(a_vault, &Pubkey::new_from_array(config.vault_pubkey))?;
+
+            // Verify vault is owned by SPL Token program.
             if a_vault.owner != &crate::spl_token::id() {
                 return Err(ProgramError::IllegalOwner);
             }

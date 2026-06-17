@@ -12580,3 +12580,98 @@ fn test_attack_hyperp_same_slot_crank_no_index_movement() {
         index_before, index_after, result
     );
 }
+
+// ============================================================================
+// C-1 POC: CloseOrphanSlab vault-key bypass
+// ============================================================================
+
+/// SECURITY POC — C-1: `handle_close_orphan_slab` (tag 73) accepts a decoy vault.
+///
+/// The handler verifies:
+///   (a) a_vault.owner == SPL Token program
+///   (b) spl_token_account.amount == 0
+///   (c) spl_token_account.owner (the SPL authority) == vault_authority_pda
+///
+/// It does NOT verify: a_vault.key == config.vault_pubkey
+///
+/// Impact: an attacker — or a rogue/compromised admin — can pass any SPL token
+/// account that satisfies (a-c) but has a completely different pubkey from the
+/// market's real vault. The handler zeroes the entire slab (destroying all
+/// market state) and drains all its lamports to `a_admin`, even when the real
+/// vault still holds user collateral. This enables permanent DoS / fund loss
+/// without ever touching the real vault.
+///
+/// The test asserts the instruction must fail. On the unfixed code the
+/// assertion fails (tx succeeds), proving the vulnerability.
+#[test]
+fn test_poc_c1_close_orphan_slab_wrong_vault() {
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // vault_authority_pda = PDA(seeds=[b"vault", slab_key], program_id)
+    let (vault_authority_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+
+    // Craft a DECOY token account:
+    //   - mint matches the market (irrelevant to the checks, but realistic)
+    //   - SPL authority == vault_authority_pda  →  passes check (c)
+    //   - amount == 0                           →  passes check (b)
+    //   - account owner == spl_token::ID        →  passes check (a)
+    // The decoy key is a fresh random pubkey, != config.vault_pubkey.
+    let decoy_vault = Pubkey::new_unique();
+    let mut decoy_data = vec![0u8; TokenAccount::LEN];
+    let mut tok = TokenAccount::default();
+    tok.mint = env.mint;
+    tok.owner = vault_authority_pda;
+    tok.amount = 0;
+    tok.state = AccountState::Initialized;
+    TokenAccount::pack(tok, &mut decoy_data).unwrap();
+
+    env.svm
+        .set_account(
+            decoy_vault,
+            Account {
+                lamports: 1_000_000,
+                data: decoy_data,
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let lamports_before = env.svm.get_account(&env.slab).unwrap().lamports;
+
+    // CloseOrphanSlab (tag 73): accounts = [admin(signer,writable), slab(writable), vault(ro)]
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(decoy_vault, false),
+        ],
+        data: vec![73u8],
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+
+    let result = env.svm.send_transaction(tx);
+
+    // SECURITY: must reject a vault whose key != config.vault_pubkey.
+    // On the unfixed program this assertion FAILS (tx returns Ok), which
+    // demonstrates the attacker can wipe the slab and steal its lamports.
+    assert!(
+        result.is_err(),
+        "SECURITY BUG C-1: CloseOrphanSlab accepted a decoy vault \
+         (key {:?} != real vault {:?}). Slab lamports drained: {} lamports",
+        decoy_vault,
+        env.vault,
+        lamports_before,
+    );
+}
