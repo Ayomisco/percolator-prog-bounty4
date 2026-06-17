@@ -15076,7 +15076,7 @@ fn v16_wrapper_claim_resolved_payout_topup_pays_only_stored_owner_receipt() {
 }
 
 #[test]
-fn v16_wrapper_refine_resolved_unreceipted_bound_is_admin_only_and_monotonic() {
+fn v16_wrapper_refine_resolved_unreceipted_bound_is_disabled() {
     let mut admin = signer();
     let mut attacker = signer();
     let mut market = market_account();
@@ -15110,28 +15110,19 @@ fn v16_wrapper_refine_resolved_unreceipted_bound_is_admin_only_and_monotonic() {
     );
     assert_err_and_market_unchanged(unauthorized, &market, &before);
 
-    run_ix(
+    // SECURITY (#313): the external RefineResolvedUnreceiptedBound is now DISABLED —
+    // even the marketauth admin is rejected. An arbitrary decrease passed the monotone-rate
+    // guard in the haircut regime and let marketauth over-drain the unreceipted reserve and
+    // strand resolved winners; the only accounting-faithful refinement is the internal
+    // source-backed-realization path. So both attacker AND admin must now be rejected with
+    // the ledger left untouched.
+    let admin_attempt = run_ix(
         Instruction::RefineResolvedUnreceiptedBound {
             decrease_num: 10 * BOUND_SCALE,
         },
         &mut [&mut admin, &mut market],
-    )
-    .unwrap();
-    let (_, group) = state::read_market(&market.data).unwrap();
-    assert_eq!(
-        group
-            .resolved_payout_ledger
-            .terminal_claim_bound_unreceipted_num,
-        90 * BOUND_SCALE
     );
-    assert_eq!(
-        group.resolved_payout_ledger.current_payout_rate_num,
-        90 * BOUND_SCALE
-    );
-    assert_eq!(
-        group.resolved_payout_ledger.current_payout_rate_den,
-        90 * BOUND_SCALE
-    );
+    assert_err_and_market_unchanged(admin_attempt, &market, &before);
 }
 
 #[test]

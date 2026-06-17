@@ -2713,8 +2713,9 @@ impl V16CuEnv {
         .expect("claim resolved payout topup")
     }
 
-    fn refine_resolved_unreceipted_bound_with_cu(&mut self, decrease_num: u128) -> u64 {
-        send_tx(
+    fn refine_resolved_unreceipted_bound_rejected(&mut self, decrease_num: u128) {
+        // #313: the external RefineResolvedUnreceiptedBound is disabled — it must be rejected.
+        let r = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
@@ -2724,8 +2725,11 @@ impl V16CuEnv {
                 AccountMeta::new(self.market, false),
             ],
             &[&self.admin],
-        )
-        .expect("refine resolved unreceipted bound")
+        );
+        assert!(
+            r.is_err(),
+            "RefineResolvedUnreceiptedBound must be rejected (disabled, #313)"
+        );
     }
 
     fn crank(&mut self, portfolio: Pubkey, ix: ProgInstruction) -> u64 {
@@ -8274,26 +8278,15 @@ fn v16_bpf_resolved_payout_tags_are_bounded_and_update_state() {
             finalized: false,
         };
     });
-    let refine_cu = refine_env.refine_resolved_unreceipted_bound_with_cu(10 * BOUND_SCALE);
-    assert_cu_within(
-        "RefineResolvedUnreceiptedBound",
-        refine_cu,
-        CUSTODY_CU_LIMIT,
-    );
+    // #313: RefineResolvedUnreceiptedBound is DISABLED — assert it is rejected and the
+    // resolved-payout ledger is left UNTOUCHED (still 100*SCALE, not drained to 90).
+    refine_env.refine_resolved_unreceipted_bound_rejected(10 * BOUND_SCALE);
     let (_, group) = refine_env.market_state();
     assert_eq!(
         group
             .resolved_payout_ledger
             .terminal_claim_bound_unreceipted_num,
-        90 * BOUND_SCALE
-    );
-    assert_eq!(
-        group.resolved_payout_ledger.current_payout_rate_num,
-        90 * BOUND_SCALE
-    );
-    assert_eq!(
-        group.resolved_payout_ledger.current_payout_rate_den,
-        90 * BOUND_SCALE
+        100 * BOUND_SCALE
     );
 }
 

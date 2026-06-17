@@ -10112,24 +10112,24 @@ pub mod processor {
 
     #[inline(never)]
     fn handle_refine_resolved_unreceipted_bound<'a>(
-        program_id: &Pubkey,
-        accounts: &'a [AccountInfo<'a>],
-        decrease_num: u128,
+        _program_id: &Pubkey,
+        _accounts: &'a [AccountInfo<'a>],
+        _decrease_num: u128,
     ) -> ProgramResult {
-        let admin = account(accounts, 0)?;
-        let market_ai = account(accounts, 1)?;
-        expect_signer(admin)?;
-        expect_writable(market_ai)?;
-        expect_owner(market_ai, program_id)?;
-        if decrease_num == 0 {
-            return Err(PercolatorError::InvalidInstruction.into());
-        }
-        let mut data = market_ai.try_borrow_mut_data()?;
-        let (cfg, mut group) = state::market_view_mut(&mut data)?;
-        expect_live_authority(&cfg.marketauth, admin.key)?;
-        group
-            .refine_resolved_unreceipted_bound_not_atomic(decrease_num)
-            .map_err(map_v16_error)
+        // SECURITY (#313): the externally-callable refine is DISABLED. The arbitrary
+        // admin `decrease_num` was guarded only by the monotone-rate check, which
+        // PASSES in the haircut regime (draining the unreceipted reserve shrinks the
+        // rate denominator while the numerator stays clamped at residual*SCALE, so the
+        // rate only rises) — letting `marketauth` over-drain `terminal_claim_bound_unreceipted_num`
+        // below outstanding winner claims and permanently strand them (close_resolved →
+        // RecoveryRequired). No correct static floor exists: source-backed realization
+        // already reduces the reserve with no tracked quantity to distinguish a malicious
+        // further decrease. The ONLY accounting-faithful refinement is the INTERNAL one in
+        // `realize_source_backed_claims_for_resolved_close_not_atomic` (engine
+        // `refine_resolved_unreceipted_bound_not_atomic`, clamped to realized face as
+        // receipts realize), which is a direct engine call and is unaffected. Reject the
+        // external entry point. Do NOT re-enable without a per-claim outstanding-obligation floor.
+        Err(PercolatorError::InvalidInstruction.into())
     }
 
     #[inline(never)]
