@@ -16037,9 +16037,13 @@ pub mod processor {
         }
 
         let bump = slab_data[12];
+        // Verify a_vault.key matches config.vault_pubkey — prevents
+        // vault substitution with an arbitrary SPL account.
+        let config = state::read_config(&slab_data);
+        accounts::expect_key(a_vault, &Pubkey::new_from_array(config.vault_pubkey))?;
         drop(slab_data);
 
-        // H-1: Verify vault is owned by SPL Token program.
+        // Verify vault is owned by SPL Token program.
         if a_vault.owner != &crate::spl_token::id() {
             return Err(ProgramError::IllegalOwner);
         }

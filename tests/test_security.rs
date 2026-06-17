@@ -12675,3 +12675,107 @@ fn test_poc_c1_close_orphan_slab_wrong_vault() {
         lamports_before,
     );
 }
+
+// ============================================================================
+// H-1 POC: RescueOrphanVault vault-key bypass
+// ============================================================================
+
+/// SECURITY POC — H-1: `handle_rescue_orphan_vault` (tag 72) drains a wrong vault.
+///
+/// The handler verifies:
+///   (a) market is resolved (FLAG_RESOLVED set)
+///   (b) num_used_accounts == 0
+///   (c) a_vault.owner == SPL Token program
+///   (d) spl_token_account.owner (authority) == vault_authority_pda
+///   (e) admin_ata.mint == vault_token.mint
+///
+/// It does NOT verify: a_vault.key == config.vault_pubkey
+///
+/// Impact: any resolved market with 0 open accounts can have a DIFFERENT
+/// SPL token account — one that is also owned by vault_authority_pda, such
+/// as an LP escrow or any collateral side-account — drained to the admin's
+/// ATA. The real vault is untouched; a separate account is looted.
+///
+/// The test asserts the instruction must fail. On the unfixed program this
+/// assertion fails (tx returns Ok), proving the vulnerability.
+#[test]
+fn test_poc_h1_rescue_orphan_vault_wrong_vault() {
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // Resolve the market (required by the handler — FLAG_RESOLVED must be set)
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_resolve_market(&admin, 0)
+        .expect("resolve_market should succeed on an idle market");
+
+    // Derive vault authority PDA
+    let (vault_authority_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+
+    // Build a VICTIM token account: correct SPL authority, non-zero balance,
+    // but DIFFERENT key than config.vault_pubkey.
+    // This simulates an LP escrow or any other collateral side-account that
+    // happens to share the same vault_authority_pda as its SPL owner.
+    let victim_vault = Pubkey::new_unique(); // != config.vault_pubkey
+    let victim_balance: u64 = 500_000_000;
+    let mut victim_data = vec![0u8; TokenAccount::LEN];
+    let mut tok = TokenAccount::default();
+    tok.mint = env.mint;
+    tok.owner = vault_authority_pda; // passes check (d)
+    tok.amount = victim_balance;
+    tok.state = AccountState::Initialized;
+    TokenAccount::pack(tok, &mut victim_data).unwrap();
+
+    env.svm
+        .set_account(
+            victim_vault,
+            Account {
+                lamports: 1_000_000,
+                data: victim_data,
+                owner: spl_token::ID, // passes check (c)
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Admin ATA to receive drained tokens
+    let admin_ata = env.create_ata(&admin.pubkey(), 0);
+
+    // RescueOrphanVault (tag 72):
+    // accounts = [admin(signer), slab, admin_ata(writable), vault(writable),
+    //             token_program, vault_pda]
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new(admin_ata, false),
+            AccountMeta::new(victim_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(vault_authority_pda, false),
+        ],
+        data: vec![72u8], // TAG_RESCUE_ORPHAN_VAULT
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+
+    let result = env.svm.send_transaction(tx);
+
+    // SECURITY: must reject a vault whose key != config.vault_pubkey.
+    // On the unfixed program this assertion FAILS (tx returns Ok), meaning
+    // 500_000_000 tokens were drained from the victim account to admin_ata.
+    assert!(
+        result.is_err(),
+        "SECURITY BUG H-1: RescueOrphanVault drained a decoy vault \
+         (key {:?} != real vault {:?}). {} tokens stolen from wrong account.",
+        victim_vault,
+        env.vault,
+        victim_balance,
+    );
+}
