@@ -12779,3 +12779,71 @@ fn test_poc_h1_rescue_orphan_vault_wrong_vault() {
         victim_balance,
     );
 }
+
+/// POC for H-2: Four admin-only handlers (CloseStaleSlabs/51, AttestCrossMargin/55,
+/// RescueOrphanVault/72, CloseOrphanSlab/73) do not call slab_guard(), so the
+/// FLAG_CPI_IN_PROGRESS reentrancy guard is never checked.
+///
+/// A malicious matcher program that receives a CPI from TradeCpi can re-enter
+/// any of these handlers while FLAG_CPI_IN_PROGRESS is set, mutating or
+/// destroying slab state mid-instruction.
+///
+/// This test proves the bug on CloseOrphanSlab (tag 73):
+///   1. Initialise a market normally.
+///   2. Manually set FLAG_CPI_IN_PROGRESS in the slab flags byte (offset 13).
+///   3. Call CloseOrphanSlab — a properly guarded handler rejects with
+///      InvalidAccountData; the unguarded handler proceeds and zeroes the slab.
+///
+/// On the unfixed program the assertion FAILS (tx returns Ok), proving the
+/// reentrancy guard was bypassed.
+#[test]
+fn test_poc_h2_slab_guard_bypass_cpi_in_progress() {
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // Simulate the slab state that exists while TradeCpi's matcher CPI is
+    // executing: set FLAG_CPI_IN_PROGRESS (bit 2 = 0x04) at FLAGS_OFF (13).
+    let mut slab_account = env.svm.get_account(&env.slab).unwrap();
+    const FLAGS_OFF: usize = 13;
+    const FLAG_CPI_IN_PROGRESS: u8 = 1 << 2;
+    slab_account.data[FLAGS_OFF] |= FLAG_CPI_IN_PROGRESS;
+    env.svm.set_account(env.slab, slab_account).unwrap();
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // CloseOrphanSlab (tag 73):
+    // accounts = [admin(signer,writable), slab(writable), vault(ro)]
+    // env.vault was initialised with 0 tokens so the vault-balance guard passes;
+    // the only thing that should (but does not) block this is slab_guard().
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.vault, false),
+        ],
+        data: vec![73u8], // TAG_CLOSE_ORPHAN_SLAB
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+
+    let result = env.svm.send_transaction(tx);
+
+    // SECURITY: slab_guard() must reject when FLAG_CPI_IN_PROGRESS is set,
+    // preventing any handler from mutating slab state mid-CPI.
+    // On the unfixed program this assertion FAILS (tx returns Ok): the handler
+    // zeroed the entire slab and drained its lamports to admin while a CPI
+    // was ostensibly in progress — reentrancy guard completely bypassed.
+    assert!(
+        result.is_err(),
+        "SECURITY BUG H-2: CloseOrphanSlab (tag 73) executed while \
+         FLAG_CPI_IN_PROGRESS was set in slab flags[{}]. The reentrancy \
+         guard was bypassed — slab state was zeroed mid-CPI.",
+        FLAGS_OFF,
+    );
+}

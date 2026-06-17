@@ -14740,6 +14740,13 @@ pub mod processor {
             return Err(PercolatorError::InvalidMagic.into());
         }
 
+        // Reject while a CPI is in progress.  slab_guard() would also work for
+        // current-format slabs but this handler intentionally handles older,
+        // non-standard-length slabs, so we check the flag directly.
+        if state::is_cpi_in_progress(&slab_data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         let admin_bytes: [u8; 32] = slab_data[ADMIN_OFF..ADMIN_END]
             .try_into()
             .map_err(|_| PercolatorError::InvalidMagic)?;
@@ -15186,6 +15193,7 @@ pub mod processor {
         if data_a.len() < ENGINE_OFF + ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
+        slab_guard(program_id, a_slab_a, &data_a)?;
         let engine_a = zc::engine_ref(&data_a)?;
         check_idx(engine_a, user_idx_a)?;
         let pos_a = engine_a.accounts[user_idx_a as usize].position_basis_q;
@@ -15197,6 +15205,7 @@ pub mod processor {
         if data_b.len() < ENGINE_OFF + ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
+        slab_guard(program_id, a_slab_b, &data_b)?;
         let engine_b = zc::engine_ref(&data_b)?;
         check_idx(engine_b, user_idx_b)?;
         let pos_b = engine_b.accounts[user_idx_b as usize].position_basis_q;
@@ -16005,6 +16014,8 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        slab_guard(program_id, a_slab, &slab_data)?;
+
         let admin_bytes: [u8; 32] = slab_data[16..48]
             .try_into()
             .map_err(|_| ProgramError::InvalidAccountData)?;
@@ -16131,6 +16142,8 @@ pub mod processor {
             if magic != MAGIC {
                 return Err(ProgramError::InvalidAccountData);
             }
+
+            slab_guard(program_id, a_slab, &slab_data)?;
 
             let admin_bytes: [u8; 32] = slab_data[16..48]
                 .try_into()
