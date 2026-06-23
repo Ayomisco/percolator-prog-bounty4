@@ -7895,6 +7895,7 @@ pub mod processor {
         let market_ai = account(accounts, 1)?;
         let portfolio_ai = account(accounts, 2)?;
         expect_signer(closer)?;
+        expect_writable(closer)?;
         expect_writable(market_ai)?;
         expect_writable(portfolio_ai)?;
         expect_owner(market_ai, program_id)?;
@@ -7922,7 +7923,7 @@ pub mod processor {
                 .deregister_empty_materialized_portfolio_not_atomic(&portfolio.as_view())
                 .map_err(map_v16_error)?;
         }
-        close_portfolio_account_to_market_slab(portfolio_ai, market_ai)?;
+        close_portfolio_account_to_market_slab(portfolio_ai, closer)?;
         Ok(())
     }
 
@@ -13456,7 +13457,7 @@ pub mod processor {
 
     fn close_portfolio_account_to_market_slab(
         portfolio_ai: &AccountInfo<'_>,
-        market_ai: &AccountInfo<'_>,
+        rent_dest_ai: &AccountInfo<'_>,
     ) -> ProgramResult {
         {
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
@@ -13469,7 +13470,7 @@ pub mod processor {
         let portfolio_lamports = portfolio_ai.lamports();
         if portfolio_lamports != 0 {
             **portfolio_ai.lamports.borrow_mut() = 0;
-            **market_ai.lamports.borrow_mut() = market_ai
+            **rent_dest_ai.lamports.borrow_mut() = rent_dest_ai
                 .lamports()
                 .checked_add(portfolio_lamports)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
